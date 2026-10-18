@@ -12,8 +12,8 @@ export class AdminStatsService {
     const [
       aggregation,
       stateGroups,
-      vendorGroups,
-      buyerGroups,
+      uniqueVendorsResult,
+      uniqueBuyersResult,
       totalDisputes,
       openDisputes,
     ] = await Promise.all([
@@ -24,11 +24,14 @@ export class AdminStatsService {
         by: ['state'],
         _count: true,
       }),
-      // Distinct participants, via groupBy. `aggregate._count.vendorAddress`
-      // counts non-null *rows*, not distinct values, so it reported the total
-      // escrow count under the name "unique vendors".
-      this.prisma.escrow.groupBy({ by: ['vendorAddress'] }),
-      this.prisma.escrow.groupBy({ by: ['buyerAddress'] }),
+      // Count distinct vendors in SQL
+      this.prisma.$queryRaw<[{ count: bigint }]>`
+        SELECT COUNT(DISTINCT "vendorAddress") as count FROM "Escrow"
+      `,
+      // Count distinct buyers in SQL
+      this.prisma.$queryRaw<[{ count: bigint }]>`
+        SELECT COUNT(DISTINCT "buyerAddress") as count FROM "Escrow"
+      `,
       this.prisma.dispute.count(),
       this.prisma.dispute.count({
         where: {
@@ -44,8 +47,8 @@ export class AdminStatsService {
       0,
     );
     const totalVolume = Number(aggregation._sum?.amount ?? 0);
-    const uniqueVendors = vendorGroups.length;
-    const uniqueBuyers = buyerGroups.length;
+    const uniqueVendors = Number(uniqueVendorsResult[0].count);
+    const uniqueBuyers = Number(uniqueBuyersResult[0].count);
     const averageEscrowAmount =
       totalEscrows > 0 ? totalVolume / totalEscrows : 0;
 
