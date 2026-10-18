@@ -13,13 +13,14 @@
         "start:prod": "node dist/main",
         "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",
         "lint:check": "eslint \"{src,apps,libs,test}/**/*.ts\" --cache --cache-location .eslintcache",
-        "test": "cross-env NODE_OPTIONS=--experimental-vm-modules jest",
-        "test:watch": "cross-env NODE_OPTIONS=--experimental-vm-modules jest --watch",
-        "test:integration": "cross-env NODE_OPTIONS=--experimental-vm-modules jest --config ./test/jest-integration.json",
-        "test:cov": "cross-env NODE_OPTIONS=--experimental-vm-modules jest --coverage",
+        "test": "jest",
+        "test:watch": "jest --watch",
+        "test:integration": "jest --config ./test/jest-integration.json",
+        "test:cov": "jest --coverage",
         "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
         "test:e2e": "jest --config ./test/jest-e2e.json",
         "check-coverage": "node scripts/check_coverage.js",
+        "check-licences": "node scripts/check-licences.js",
         "openapi:generate": "ts-node scripts/generate-openapi.ts",
         "check-test-match": "node scripts/check_test_match.js",
         "db:generate": "prisma generate",
@@ -34,9 +35,11 @@
         "docker:run": "docker run -p 3000:3000 trustlink-backend",
         "stress:test": "ts-node scripts/stress-test-runner.ts",
         "stress:test:config": "ts-node scripts/stress-test-runner.ts",
-        "benchmark:chart": "ts-node scripts/benchmark-chart-aggregation.ts"
+        "benchmark:chart": "ts-node scripts/benchmark-chart-aggregation.ts",
+        "prepare": "node -e \"try { require.resolve('./scripts/install-hooks.js') } catch { process.exit(0) } require('./scripts/install-hooks.js')\""
     },
     "dependencies": {
+        "@nest-lab/throttler-storage-redis": "^1.2.0",
         "@nestjs/axios": "^4.0.0",
         "@nestjs/common": "^11.0.1",
         "@nestjs/config": "^4.0.0",
@@ -56,7 +59,7 @@
         "@prisma/client": "^7.8.0",
         "@sendgrid/mail": "^8.1.6",
         "@sentry/nestjs": "^10.55.0",
-        "@stellar/stellar-sdk": "^15.1.0",
+        "@stellar/stellar-sdk": "^17.1.0",
         "axios": "^1.18.1",
         "bullmq": "^5.77.6",
         "class-transformer": "^0.5.1",
@@ -118,11 +121,15 @@
                     "tsconfig": {
                         "module": "commonjs",
                         "moduleResolution": "node",
-                        "resolvePackageJsonExports": false
+                        "resolvePackageJsonExports": false,
+                        "allowJs": true
                     }
                 }
             ]
         },
+        "transformIgnorePatterns": [
+            "[/\\\\]node_modules[/\\\\](?!(.pnpm[/\\\\])?(uint8array-extras|@exodus|@noble|@stellar))"
+        ],
         "collectCoverageFrom": [
             "src/**/*.ts",
             "!src/**/*.spec.ts",
@@ -147,7 +154,8 @@
         "seed": "ts-node prisma/seed.ts"
     },
     "overrides": {
-        "brace-expansion": "5.0.8",
+        "brace-expansion": "5.0.9",
+        "deepmerge-ts": "8.0.2",
         "js-yaml": "5.2.2",
         "find-my-way": "9.7.0",
         "valibot": "1.4.2",

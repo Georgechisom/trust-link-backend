@@ -14,31 +14,32 @@
  * for ConfigService, EscrowRepository, and (where needed) PrismaService.
  */
 
-import { BadRequestException } from '@nestjs/common';
+import {
+  BadRequestException,
+  InternalServerErrorException,
+  Logger,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '../config/config.service';
 import { EscrowRepository } from '../escrow/escrow.repository';
 import { NotificationsService } from '../notifications/notifications.service';
+import { EscrowRecord } from '../prisma/prisma.service';
 import { StellarWebhookDto } from './dto/stellar-webhook.dto';
+import { StellarWebhookRepository } from './stellar-webhook.repository';
 import { StellarWebhookService } from './stellar-webhook.service';
+import { TracingService } from '../tracing/tracing.service';
+import { createTracingMock } from '../../test/unit/tracing-mock';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Build a minimal EscrowRecord-like object for test fixtures. */
-function makeEscrow(
-  overrides: Partial<{
-    id: string;
-    state: string;
-    amount: number;
-    currency: string;
-    vendorAddress: string;
-    buyerAddress: string;
-  }> = {},
-) {
+/** Build an EscrowRecord for test fixtures. */
+function makeEscrow(overrides: Partial<EscrowRecord> = {}): EscrowRecord {
   return {
     id: 'escrow-1',
+    contractEscrowId: null,
     state: 'CREATED',
     // Plain number – Number(500) === 500 so the service's Number(escrow.amount) works correctly.
     amount: 500,
@@ -79,6 +80,26 @@ function makePaymentDto(
   };
 }
 
+/**
+ * In-memory stand-in for the persisted `ProcessedWebhookEvent` cursor. The
+ * service no longer keeps its own dedupe state, so tests must supply a
+ * repository that actually remembers what was marked.
+ */
+function makeWebhookRepositoryMock(): jest.Mocked<StellarWebhookRepository> {
+  const processed = new Set<string>();
+  return {
+    isProcessed: jest.fn((id: string) => Promise.resolve(processed.has(id))),
+    markProcessed: jest.fn((id: string) => {
+      processed.add(id);
+      return Promise.resolve();
+    }),
+    unmarkProcessed: jest.fn((id: string) => {
+      processed.delete(id);
+      return Promise.resolve();
+    }),
+  } as unknown as jest.Mocked<StellarWebhookRepository>;
+}
+
 // ---------------------------------------------------------------------------
 // Test setup
 // ---------------------------------------------------------------------------
@@ -111,10 +132,15 @@ describe('StellarWebhookService – handlePayment (issue #396)', () => {
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
+        { provide: TracingService, useValue: createTracingMock().service },
         StellarWebhookService,
         { provide: EscrowRepository, useValue: mockEscrowRepository },
         { provide: ConfigService, useValue: mockConfigService },
         { provide: NotificationsService, useValue: mockNotificationsService },
+        {
+          provide: StellarWebhookRepository,
+          useValue: makeWebhookRepositoryMock(),
+        },
       ],
     }).compile();
 
@@ -125,11 +151,11 @@ describe('StellarWebhookService – handlePayment (issue #396)', () => {
     // Silence logger output during tests but capture calls for assertions.
 
     loggerWarnSpy = jest
-      .spyOn((service as any).logger, 'warn')
+      .spyOn(service['logger'], 'warn')
       .mockImplementation(() => undefined);
 
     loggerLogSpy = jest
-      .spyOn((service as any).logger, 'log')
+      .spyOn(service['logger'], 'log')
       .mockImplementation(() => undefined);
   });
 
@@ -151,11 +177,11 @@ describe('StellarWebhookService – handlePayment (issue #396)', () => {
       amount: 500,
       currency: 'USDC',
     });
-    escrowRepository.findByVendor.mockResolvedValue([escrow] as any);
+    escrowRepository.findByVendor.mockResolvedValue([escrow]);
     escrowRepository.updateState.mockResolvedValue({
       ...escrow,
       state: 'FUNDED',
-    } as any);
+    });
 
     const dto = makePaymentDto({ amount: '500.0000000', asset_code: 'USDC' });
     await runPayment(dto);
@@ -190,7 +216,7 @@ describe('StellarWebhookService – handlePayment (issue #396)', () => {
       amount: 500,
       currency: 'USDC',
     });
-    escrowRepository.findByVendor.mockResolvedValue([escrow] as any);
+    escrowRepository.findByVendor.mockResolvedValue([escrow]);
 
     const dto = makePaymentDto({ amount: '499.9999999', asset_code: 'USDC' });
     await runPayment(dto);
@@ -210,7 +236,7 @@ describe('StellarWebhookService – handlePayment (issue #396)', () => {
       amount: 500,
       currency: 'USDC',
     });
-    escrowRepository.findByVendor.mockResolvedValue([escrow] as any);
+    escrowRepository.findByVendor.mockResolvedValue([escrow]);
 
     const dto = makePaymentDto({ amount: '500.0000001', asset_code: 'USDC' });
     await runPayment(dto);
@@ -230,7 +256,7 @@ describe('StellarWebhookService – handlePayment (issue #396)', () => {
       amount: 500,
       currency: 'USDC',
     });
-    escrowRepository.findByVendor.mockResolvedValue([escrow] as any);
+    escrowRepository.findByVendor.mockResolvedValue([escrow]);
 
     const dto = makePaymentDto({ amount: '500.0000000', asset_code: 'XLM' });
     await runPayment(dto);
@@ -247,11 +273,11 @@ describe('StellarWebhookService – handlePayment (issue #396)', () => {
       amount: 500,
       currency: 'USDC',
     });
-    escrowRepository.findByVendor.mockResolvedValue([escrow] as any);
+    escrowRepository.findByVendor.mockResolvedValue([escrow]);
     escrowRepository.updateState.mockResolvedValue({
       ...escrow,
       state: 'FUNDED',
-    } as any);
+    });
 
     const dto = makePaymentDto({ amount: '500.0000000', asset_code: 'usdc' });
     await runPayment(dto);
@@ -269,11 +295,11 @@ describe('StellarWebhookService – handlePayment (issue #396)', () => {
       amount: 100,
       currency: 'XLM',
     });
-    escrowRepository.findByVendor.mockResolvedValue([escrow] as any);
+    escrowRepository.findByVendor.mockResolvedValue([escrow]);
     escrowRepository.updateState.mockResolvedValue({
       ...escrow,
       state: 'FUNDED',
-    } as any);
+    });
 
     const dto = makePaymentDto({
       amount: '100.0000000',
@@ -297,7 +323,7 @@ describe('StellarWebhookService – handlePayment (issue #396)', () => {
       amount: 500,
       currency: 'USDC',
     });
-    escrowRepository.findByVendor.mockResolvedValue([escrow] as any);
+    escrowRepository.findByVendor.mockResolvedValue([escrow]);
 
     const dto = makePaymentDto({ amount: '500.0000000', asset_code: 'USDC' });
     await runPayment(dto);
@@ -327,6 +353,49 @@ describe('StellarWebhookService – handlePayment (issue #396)', () => {
   // =========================================================================
   // Additional edge-case: missing dto.to throws BadRequestException
   // =========================================================================
+  // =========================================================================
+  // Notification delivery must not hold up the webhook response
+  // =========================================================================
+  it('does not wait on notifyFunded delivery', async () => {
+    const escrow = makeEscrow({ state: 'CREATED' });
+    escrowRepository.findByVendor.mockResolvedValue([escrow]);
+    escrowRepository.updateState.mockResolvedValue({
+      ...escrow,
+      state: 'FUNDED',
+    });
+    notificationsService.notifyFunded.mockReturnValue(new Promise(() => {}));
+
+    await expect(runPayment(makePaymentDto())).resolves.toEqual({
+      processed: true,
+    });
+
+    expect(notificationsService.notifyFunded).toHaveBeenCalledTimes(1);
+  });
+
+  it('logs a failed notifyFunded without failing the webhook', async () => {
+    const escrow = makeEscrow({ state: 'CREATED' });
+    escrowRepository.findByVendor.mockResolvedValue([escrow]);
+    escrowRepository.updateState.mockResolvedValue({
+      ...escrow,
+      state: 'FUNDED',
+    });
+    const error = new Error('provider down');
+    notificationsService.notifyFunded.mockRejectedValue(error);
+    const loggerErrorSpy = jest
+      .spyOn(service['logger'], 'error')
+      .mockImplementation(() => undefined);
+
+    await expect(runPayment(makePaymentDto())).resolves.toEqual({
+      processed: true,
+    });
+    await new Promise(process.nextTick);
+
+    expect(loggerErrorSpy).toHaveBeenCalledWith(
+      `Failed to send funded notification for escrow ${escrow.id}`,
+      error,
+    );
+  });
+
   it('throws BadRequestException when dto.to is missing', async () => {
     const dto = makePaymentDto({ to: undefined });
     await expect(runPayment(dto)).rejects.toThrow(BadRequestException);
@@ -346,5 +415,254 @@ describe('StellarWebhookService – handlePayment (issue #396)', () => {
     await expect(runPayment(dto)).resolves.not.toThrow();
     expect(escrowRepository.findByVendor).not.toHaveBeenCalled();
     expect(escrowRepository.updateState).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issues #734 / #922 — persisted duplicate-delivery (replay) guard
+// ---------------------------------------------------------------------------
+
+import * as crypto from 'crypto';
+
+const WEBHOOK_SECRET = 'test-webhook-secret';
+
+/** Compute a valid HMAC-SHA256 hex signature for rawBody using WEBHOOK_SECRET. */
+function sign(rawBody: Buffer): string {
+  return crypto
+    .createHmac('sha256', WEBHOOK_SECRET)
+    .update(rawBody)
+    .digest('hex');
+}
+
+describe('StellarWebhookService — persisted replay guard (issues #734, #922)', () => {
+  let escrowRepository: jest.Mocked<
+    Pick<EscrowRepository, 'findByVendor' | 'updateState'>
+  >;
+  let notificationsService: jest.Mocked<
+    Pick<NotificationsService, 'notifyFunded'>
+  >;
+  let webhookRepository: jest.Mocked<StellarWebhookRepository>;
+
+  /** Build a service instance wired to the persisted webhook cursor. */
+  function makeService(): StellarWebhookService {
+    return new StellarWebhookService(
+      {
+        get: jest.fn().mockImplementation((key: string) => {
+          if (key === 'STELLAR_WEBHOOK_SECRET') return WEBHOOK_SECRET;
+          return undefined;
+        }),
+      } as unknown as ConfigService,
+      escrowRepository as unknown as EscrowRepository,
+      notificationsService as unknown as NotificationsService,
+      webhookRepository,
+    );
+  }
+
+  beforeEach(() => {
+    escrowRepository = {
+      findByVendor: jest.fn().mockResolvedValue([]),
+      updateState: jest.fn(),
+    };
+    notificationsService = {
+      notifyFunded: jest.fn().mockResolvedValue(undefined),
+    };
+    webhookRepository = makeWebhookRepositoryMock();
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  // ── Helper ────────────────────────────────────────────────────────────────
+
+  async function callHandleEvent(
+    service: StellarWebhookService,
+    dto: StellarWebhookDto,
+  ) {
+    const rawBody = Buffer.from(JSON.stringify(dto));
+    const signature = sign(rawBody);
+    return service.handleEvent(rawBody, signature, dto);
+  }
+
+  // ── Issue #922: replay must honour the persisted dedupe ───────────────────
+
+  describe('persisted dedupe across the webhook and replay paths', () => {
+    it('skips an operation already processed by the webhook when replaying', async () => {
+      const service = makeService();
+      const dto = makePaymentDto({ id: 'op-replay-dedupe' });
+
+      const delivered = await callHandleEvent(service, dto);
+      expect(delivered).toEqual({ received: true });
+      expect(webhookRepository.markProcessed).toHaveBeenCalledWith(
+        'op-replay-dedupe',
+      );
+
+      // Replay of the same operation must observe the persisted mark and skip.
+      const replayed = await service.processOperationDto(dto);
+      expect(replayed).toEqual({ processed: false, skipped: true });
+      expect(escrowRepository.findByVendor).toHaveBeenCalledTimes(1);
+    });
+
+    it('marks and rolls back the persisted cursor on processing failure', async () => {
+      const service = makeService();
+      const dto = makePaymentDto({ id: 'op-persisted-rollback' });
+      escrowRepository.findByVendor.mockRejectedValueOnce(
+        new Error('DB unavailable'),
+      );
+
+      // The first delivery fails — the persisted mark must be rolled back.
+      await callHandleEvent(service, dto).catch(() => undefined);
+
+      expect(webhookRepository.markProcessed).toHaveBeenCalledWith(
+        'op-persisted-rollback',
+      );
+      expect(webhookRepository.unmarkProcessed).toHaveBeenCalledWith(
+        'op-persisted-rollback',
+      );
+
+      // Second delivery with the same id must not be treated as a duplicate.
+      escrowRepository.findByVendor.mockResolvedValueOnce([]);
+      const retry = await callHandleEvent(service, dto);
+
+      expect(retry.skipped).toBeUndefined();
+      expect(retry).toEqual({ received: true });
+    });
+  });
+
+  // ── Duplicate guard via the persisted cursor ─────────────────────────────
+
+  describe('duplicate-delivery (replay) guard', () => {
+    it('returns skipped:true on the second delivery of the same operation id', async () => {
+      const service = makeService();
+      const dto = makePaymentDto({ id: 'op-replay-001' });
+
+      const first = await callHandleEvent(service, dto);
+      const second = await callHandleEvent(service, dto);
+
+      expect(first).toEqual({ received: true });
+      expect(second).toEqual({
+        received: true,
+        skipped: true,
+        reason: 'duplicate',
+      });
+    });
+
+    it('processes the event only once when delivered twice', async () => {
+      const service = makeService();
+      const escrow = makeEscrow({
+        state: 'CREATED',
+        amount: 500,
+        currency: 'USDC',
+      });
+      escrowRepository.findByVendor.mockResolvedValue([escrow]);
+      escrowRepository.updateState.mockResolvedValue({
+        ...escrow,
+        state: 'FUNDED',
+      });
+      notificationsService.notifyFunded.mockResolvedValue(undefined);
+
+      const dto = makePaymentDto({ id: 'op-replay-002' });
+
+      await callHandleEvent(service, dto);
+      await callHandleEvent(service, dto);
+
+      // updateState must have been called exactly once despite two deliveries
+      expect(escrowRepository.updateState).toHaveBeenCalledTimes(1);
+    });
+
+    it('a third distinct id is not treated as a duplicate', async () => {
+      const service = makeService();
+
+      await callHandleEvent(service, makePaymentDto({ id: 'op-A' }));
+      await callHandleEvent(service, makePaymentDto({ id: 'op-A' })); // duplicate
+      const result = await callHandleEvent(
+        service,
+        makePaymentDto({ id: 'op-B' }),
+      );
+
+      expect(result).toEqual({ received: true });
+      // findByVendor called for op-A (first) and op-B — not for the duplicate
+      expect(escrowRepository.findByVendor).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // ── Ported from test/unit/stellar-webhook.service.spec.ts (issue #759) ───
+  // The rest of this file drives handleEvent with a secret always configured
+  // and a valid signature already computed by callHandleEvent/sign — none of
+  // it exercises verifySignature's own rejection paths.
+  describe('signature verification', () => {
+    /** Build a service instance with no STELLAR_WEBHOOK_SECRET configured. */
+    function makeServiceNoSecret(): StellarWebhookService {
+      return new StellarWebhookService(
+        {
+          get: jest.fn().mockReturnValue(undefined),
+        } as unknown as ConfigService,
+        escrowRepository as unknown as EscrowRepository,
+        notificationsService as unknown as NotificationsService,
+        webhookRepository,
+      );
+    }
+
+    it('rejects when STELLAR_WEBHOOK_SECRET is not configured', async () => {
+      const service = makeServiceNoSecret();
+      const dto = makePaymentDto();
+      const rawBody = Buffer.from(JSON.stringify(dto));
+
+      await expect(
+        service.handleEvent(rawBody, undefined, dto),
+      ).rejects.toThrow(InternalServerErrorException);
+    });
+
+    it('accepts a valid HMAC-SHA256 signature', async () => {
+      const service = makeService();
+      const dto = makePaymentDto({ id: 'op-sig-valid' });
+      const rawBody = Buffer.from(JSON.stringify(dto));
+      const signature = sign(rawBody);
+
+      await expect(
+        service.handleEvent(rawBody, signature, dto),
+      ).resolves.toEqual({ received: true });
+    });
+
+    it('rejects a tampered signature', async () => {
+      const service = makeService();
+      const dto = makePaymentDto({ id: 'op-sig-tampered' });
+      const rawBody = Buffer.from(JSON.stringify(dto));
+
+      await expect(
+        service.handleEvent(rawBody, 'deadbeef', dto),
+      ).rejects.toThrow(UnauthorizedException);
+    });
+
+    it('rejects when signature header is missing and secret is configured', async () => {
+      const service = makeService();
+      const dto = makePaymentDto({ id: 'op-sig-missing' });
+      const rawBody = Buffer.from(JSON.stringify(dto));
+
+      await expect(
+        service.handleEvent(rawBody, undefined, dto),
+      ).rejects.toThrow(UnauthorizedException);
+    });
+
+    it('logs webhook processing failures with event context before rethrowing', async () => {
+      const service = makeService();
+      const dto = makePaymentDto({ id: 'op-sig-log-fail', to: undefined });
+      const rawBody = Buffer.from(JSON.stringify(dto));
+      const signature = sign(rawBody);
+      const loggerErrorSpy = jest
+        .spyOn(Logger.prototype, 'error')
+        .mockImplementation();
+
+      await expect(
+        service.handleEvent(rawBody, signature, dto),
+      ).rejects.toThrow(BadRequestException);
+
+      expect(loggerErrorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('stellar.webhook.processing_failed'),
+        expect.any(String),
+      );
+
+      loggerErrorSpy.mockRestore();
+    });
   });
 });

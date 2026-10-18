@@ -8,6 +8,7 @@ import { ConfigService } from '../../src/config/config.service';
 import { EscrowRepository } from '../../src/escrow/escrow.repository';
 import { NotificationsService } from '../../src/notifications/notifications.service';
 import { StellarWebhookDto } from '../../src/webhooks/dto/stellar-webhook.dto';
+import { StellarWebhookRepository } from '../../src/webhooks/stellar-webhook.repository';
 import { StellarWebhookService } from '../../src/webhooks/stellar-webhook.service';
 
 /**
@@ -66,6 +67,14 @@ describe('StellarWebhookService — HMAC signature verification (issue #48)', ()
         {
           provide: NotificationsService,
           useValue: { notifyFunded: jest.fn() },
+        },
+        {
+          provide: StellarWebhookRepository,
+          useValue: {
+            isProcessed: jest.fn().mockResolvedValue(false),
+            markProcessed: jest.fn().mockResolvedValue(undefined),
+            unmarkProcessed: jest.fn().mockResolvedValue(undefined),
+          },
         },
       ],
     }).compile();

@@ -223,4 +223,31 @@ describe('POST /webhooks/stellar (issue #294)', () => {
       .send(invalidPayload)
       .expect(400);
   });
+
+  // ── Rate limiting (issue #923) ─────────────────────────────────────────────
+
+  it('accepts a burst of 61 signed deliveries without a 429', async () => {
+    // The default public limit (and the old route-level @Throttle) was 60 per
+    // minute, so the 61st delivery used to be dropped. Every delivery comes
+    // from the same Horizon sender, so the signed webhook must be exempt from
+    // rate limiting; signature verification still guards it.
+    const statuses: number[] = [];
+    for (let i = 0; i < 61; i++) {
+      const payload = makeWebhookPayload({ id: `op-burst-${i}` });
+      const body = Buffer.from(JSON.stringify(payload), 'utf8');
+      const sig = sign(body, WEBHOOK_SECRET);
+
+      const res = await request(app.getHttpServer())
+        .post('/webhooks/stellar')
+        .set('Content-Type', 'application/json')
+        .set('x-stellar-signature', sig)
+        .send(payload);
+
+      statuses.push(res.status);
+    }
+
+    expect(statuses.every((status) => status >= 200 && status < 300)).toBe(
+      true,
+    );
+  });
 });

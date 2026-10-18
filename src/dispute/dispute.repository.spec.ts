@@ -14,7 +14,10 @@ describe('DisputeRepository', () => {
     // behind — and jest's file ordering is not stable (#475).
     await prisma.reset();
     await prisma.vendorProfile.createMany({
-      data: [{ address: 'vendor', businessName: 'Test Vendor' }],
+      data: [
+        { address: 'vendor', businessName: 'Test Vendor' },
+        { address: 'vendor-1', businessName: 'Vendor 1' },
+      ],
       skipDuplicates: true,
     });
     disputeRepo = new DisputeRepository(prisma);

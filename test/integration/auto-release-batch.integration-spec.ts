@@ -5,8 +5,12 @@ import { DisputeRepository } from '../../src/dispute/dispute.repository';
 import { AutoReleaseWorker } from '../../src/workers/auto-release.worker';
 import { ContractService } from '../../src/stellar/contract.service';
 import { CacheService } from '../../src/cache/cache.service';
-import { ConfigService } from '../../src/config/config.service';
+import {
+  ConfigService,
+  AutoReleaseSourceNotConfiguredError,
+} from '../../src/config/config.service';
 import { ensureVendors } from '../prisma-helpers';
+import { TracingService } from '../../src/tracing/tracing.service';
 
 /**
  * Integration tests for auto-release worker batch processing with partial failures.
@@ -24,10 +28,12 @@ describe('Auto-release batch processing with partial failures', () => {
   let escrowRepository: EscrowRepository;
 
   const pastDelivery = new Date(Date.now() - 50 * 60 * 60 * 1000);
+  let nextContractEscrowId = 1n;
 
   beforeEach(async () => {
     const moduleRef: TestingModule = await Test.createTestingModule({
       providers: [
+        TracingService,
         PrismaService,
         EscrowRepository,
         DisputeRepository,
@@ -50,6 +56,13 @@ describe('Auto-release batch processing with partial failures', () => {
           provide: ConfigService,
           useValue: {
             get: jest.fn((key: string) => process.env[key]),
+            requireAutoReleaseSourceAddress: jest.fn(() => {
+              const address = process.env.AUTO_RELEASE_SOURCE_ADDRESS;
+              if (!address) {
+                throw new AutoReleaseSourceNotConfiguredError();
+              }
+              return address;
+            }),
           },
         },
       ],
@@ -61,6 +74,7 @@ describe('Auto-release batch processing with partial failures', () => {
     worker = moduleRef.get(AutoReleaseWorker);
     escrowRepository = moduleRef.get(EscrowRepository);
 
+    nextContractEscrowId = 1n;
     await prisma.reset();
     // Escrow.vendorAddress (and the vendor settings/details tables) are
     // foreign keys onto VendorProfile.address, so the parent rows must exist
@@ -92,6 +106,9 @@ describe('Auto-release batch processing with partial failures', () => {
         ...data,
         currency: 'USDC',
         state: 'SHIPPED',
+        // Every on-chain call addresses the escrow by the contract's own u64,
+        // not this row's UUID, so fixtures must carry both.
+        contractEscrowId: nextContractEscrowId++,
         shippedAt: new Date(pastDelivery.getTime() - 10 * 60 * 60 * 1000),
       },
     });
@@ -132,12 +149,15 @@ describe('Auto-release batch processing with partial failures', () => {
       // Second escrow fails, first and third succeed — keyed by escrow id, not
       // call order: the worker's processing sequence is decided by the query's
       // ordering, not by the order these rows were created.
-      const outcomes = new Map<string, () => Promise<string>>([
-        [escrow1.id, () => Promise.resolve('tx-hash-1')],
-        [escrow2.id, () => Promise.reject(new Error('Network timeout'))],
-        [escrow3.id, () => Promise.resolve('tx-hash-3')],
+      const outcomes = new Map<bigint, () => Promise<string>>([
+        [escrow1.contractEscrowId!, () => Promise.resolve('tx-hash-1')],
+        [
+          escrow2.contractEscrowId!,
+          () => Promise.reject(new Error('Network timeout')),
+        ],
+        [escrow3.contractEscrowId!, () => Promise.resolve('tx-hash-3')],
       ]);
-      contractService.submitAutoRelease.mockImplementation((escrowId: string) =>
+      contractService.submitAutoRelease.mockImplementation((escrowId: bigint) =>
         (
           outcomes.get(escrowId) ??
           (() => Promise.reject(new Error(`unexpected escrow ${escrowId}`)))
@@ -214,16 +234,19 @@ describe('Auto-release batch processing with partial failures', () => {
       // returns, and the four escrows here share a deliveredAt, so the id
       // tie-break decides the sequence. A call-order mock silently attaches the
       // wrong outcome to the wrong escrow depending on generated UUIDs.
-      const outcomes = new Map<string, () => Promise<string>>([
-        [escrows[0].id, () => Promise.resolve('tx-hash-1')],
-        [escrows[1].id, () => Promise.reject(new Error('Network error'))],
+      const outcomes = new Map<bigint, () => Promise<string>>([
+        [escrows[0].contractEscrowId!, () => Promise.resolve('tx-hash-1')],
         [
-          escrows[2].id,
+          escrows[1].contractEscrowId!,
+          () => Promise.reject(new Error('Network error')),
+        ],
+        [
+          escrows[2].contractEscrowId!,
           () => Promise.reject(new Error('Insufficient balance')),
         ],
-        [escrows[3].id, () => Promise.resolve('tx-hash-4')],
+        [escrows[3].contractEscrowId!, () => Promise.resolve('tx-hash-4')],
       ]);
-      contractService.submitAutoRelease.mockImplementation((escrowId: string) =>
+      contractService.submitAutoRelease.mockImplementation((escrowId: bigint) =>
         (
           outcomes.get(escrowId) ??
           (() => Promise.reject(new Error(`unexpected escrow ${escrowId}`)))
@@ -274,11 +297,14 @@ describe('Auto-release batch processing with partial failures', () => {
       });
 
       // First fails, second succeeds — keyed by escrow id, not call order.
-      const outcomes = new Map<string, () => Promise<string>>([
-        [escrow1.id, () => Promise.reject(new Error('Transaction failed'))],
-        [escrow2.id, () => Promise.resolve('tx-hash-2')],
+      const outcomes = new Map<bigint, () => Promise<string>>([
+        [
+          escrow1.contractEscrowId!,
+          () => Promise.reject(new Error('Transaction failed')),
+        ],
+        [escrow2.contractEscrowId!, () => Promise.resolve('tx-hash-2')],
       ]);
-      contractService.submitAutoRelease.mockImplementation((escrowId: string) =>
+      contractService.submitAutoRelease.mockImplementation((escrowId: bigint) =>
         (
           outcomes.get(escrowId) ??
           (() => Promise.reject(new Error(`unexpected escrow ${escrowId}`)))

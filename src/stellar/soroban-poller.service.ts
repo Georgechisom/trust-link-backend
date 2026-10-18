@@ -5,6 +5,7 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { ConfigService } from '../config/config.service';
+import { TracingService } from '../tracing/tracing.service';
 import {
   BlockchainListenerService,
   RawSorobanEvent,
@@ -12,6 +13,7 @@ import {
 import { CursorService } from './cursor.service';
 import { EscrowService } from '../escrow/escrow.service';
 import { DlqService } from '../dlq/dlq.service';
+import { STELLAR_RPC_URLS } from './stellar-endpoints';
 
 /**
  * Issue #4 — Polls Soroban RPC for contract events and drives EscrowService.syncStateFromChain.
@@ -32,8 +34,6 @@ import { DlqService } from '../dlq/dlq.service';
  * SOROBAN_RPC_URL is unset. Production deployments must configure the URL
  * explicitly — config validation enforces this at startup.
  */
-const DEFAULT_TESTNET_RPC_URL = 'https://soroban-testnet.stellar.org';
-
 /**
  * How many ledgers behind the current one a fresh deployment starts polling
  * from. Soroban RPC nodes retain only a short window of events (~24h), so
@@ -77,6 +77,42 @@ interface GetEventsResponse {
  * malformed/unprocessable event within a few minutes at the default 5s poll
  * interval, rather than blocking every escrow behind it indefinitely.
  */
+/**
+ * Topic pairs whose naive concatenation does not match a `syncStateFromChain`
+ * case. The contract emits auto-release under ("Escrow", "Released"), which
+ * concatenates to "EscrowReleased"; the handler's case is "AutoReleased".
+ */
+const EVENT_TYPE_OVERRIDES: Readonly<Record<string, string>> = {
+  EscrowReleased: 'AutoReleased',
+  EscrowCanceled: 'EscrowCancelled',
+  EscrowCancelled: 'EscrowCancelled',
+};
+
+/**
+ * Normalises a contract `u64` escrow id to bigint.
+ *
+ * A u64 exceeds Number.MAX_SAFE_INTEGER at the top of its range, so decoders
+ * hand it back as a number for small values, a bigint or decimal string for
+ * large ones. Anything that is not a non-negative integer is rejected rather
+ * than coerced: a wrong id would address someone else's escrow.
+ */
+function toContractEscrowId(value: unknown): bigint | null {
+  try {
+    if (typeof value === 'bigint') {
+      return value >= 0n ? value : null;
+    }
+    if (typeof value === 'number') {
+      return Number.isSafeInteger(value) && value >= 0 ? BigInt(value) : null;
+    }
+    if (typeof value === 'string' && /^\d+$/.test(value)) {
+      return BigInt(value);
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 const MAX_SYNC_RETRIES = 5;
 
 @Injectable()
@@ -110,12 +146,28 @@ export class SorobanPollerService implements OnModuleInit, OnModuleDestroy {
     private readonly cursorService: CursorService,
     private readonly escrowService: EscrowService,
     private readonly dlqService: DlqService,
+    private readonly tracing: TracingService,
   ) {
     this.rpcUrl = this.resolveRpcUrl();
     this.contractId = this.config.get('CONTRACT_ID') ?? '';
     this.pollIntervalMs = this.config.get('SOROBAN_POLL_INTERVAL_MS');
     this.rpcTimeoutMs = this.config.get('SOROBAN_RPC_TIMEOUT_MS');
     this.enabled = this.config.get('SOROBAN_POLLER_ENABLED') !== false;
+  }
+
+  /**
+   * Runs `fn` inside a Soroban polling span.
+   *
+   * A polling run is the parent span, and each event handled within it becomes
+   * a child span, so a single tick and the per-escrow work it performed stay
+   * grouped in one trace.
+   */
+  private traced<T>(
+    name: string,
+    attributes: Record<string, string | number | boolean>,
+    fn: () => T | Promise<T>,
+  ): Promise<T> {
+    return this.tracing.withSpan(name, { attributes }, fn);
   }
 
   onModuleInit(): void {
@@ -161,15 +213,32 @@ export class SorobanPollerService implements OnModuleInit, OnModuleDestroy {
     if (this.polling) return; // skip if previous tick is still running
     this.polling = true;
 
+    return this.traced(
+      'stellar.soroban.poll',
+      {
+        'trustlink.stellar.network': this.networkLabel(),
+        'trustlink.stellar.contract_id': this.contractId,
+      },
+      () => this.pollInternal(),
+    );
+  }
+
+  private networkLabel(): string {
+    return this.config.get('STELLAR_NETWORK') === 'MAINNET'
+      ? 'MAINNET'
+      : 'TESTNET';
+  }
+
+  private async pollInternal(): Promise<void> {
     try {
-      let cursor = await this.cursorService.get();
+      let cursor = await this.cursorService.get(CursorService.SOROBAN_POLLER_KEY);
       if (!cursor) {
         const startLedger = await this.resolveStartLedger();
         cursor = `${LEDGER_CURSOR_PREFIX}${startLedger}`;
         // Persist before the first fetch so a restart resumes from this
         // ledger instead of computing a new starting point and skipping the
         // gap.
-        await this.cursorService.set(cursor);
+        await this.cursorService.set(cursor, CursorService.SOROBAN_POLLER_KEY);
         this.logger.log(
           `SorobanPollerService: no cursor stored — starting from ledger ${startLedger}`,
         );
@@ -177,6 +246,12 @@ export class SorobanPollerService implements OnModuleInit, OnModuleDestroy {
       const rawEvents = await this.fetchEvents(cursor);
 
       if (rawEvents.length === 0) {
+        // Issue #917: Advance cursor even when contract is quiet so startLedger stays fresh
+        const latestLedger = await this.getLatestLedger().catch(() => null);
+        if (latestLedger && cursor.startsWith(LEDGER_CURSOR_PREFIX)) {
+          const newStartLedger = Math.max(1, latestLedger - START_LEDGER_MARGIN);
+          await this.cursorService.set(`${LEDGER_CURSOR_PREFIX}${newStartLedger}`, CursorService.SOROBAN_POLLER_KEY);
+        }
         return;
       }
 
@@ -190,15 +265,6 @@ export class SorobanPollerService implements OnModuleInit, OnModuleDestroy {
         try {
           await this.processEvent(raw);
         } catch (err) {
-          // Issue #554: stop advancing the cursor at the first event that
-          // couldn't be applied. The batch is fetched in ledger order and
-          // syncStateFromChain's own switch cases assume prior transitions
-          // already landed (e.g. EscrowShipped assumes EscrowFunded already
-          // happened) — continuing past a failure and applying later events
-          // out of order risks a worse, harder-to-detect state-machine bug
-          // than the at-least-once redelivery this trades for. The next
-          // poll cycle re-fetches from the same (unmoved) cursor and
-          // retries this exact event first.
           this.logger.error(
             `SorobanPollerService: stopping batch at event "${raw.id}" — will retry next poll cycle`,
             err instanceof Error ? err.stack : String(err),
@@ -209,7 +275,7 @@ export class SorobanPollerService implements OnModuleInit, OnModuleDestroy {
       }
 
       if (lastPagingToken) {
-        await this.cursorService.set(lastPagingToken);
+        await this.cursorService.set(lastPagingToken, CursorService.SOROBAN_POLLER_KEY);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -355,9 +421,12 @@ export class SorobanPollerService implements OnModuleInit, OnModuleDestroy {
    * Parse and dispatch a single raw event. The event name is derived from both
    * topic symbols to match the switch cases in EscrowService.syncStateFromChain.
    *
-   * Contract topic layout (base64-encoded XDR ScVals):
-   *   topics[0] = Symbol("Escrow" | "Dispute" | "Auto")
-   *   topics[1] = Symbol("Funded" | "Shipped" | "Completed" | "Raised" | "Resolved" | "Released")
+   * Contract topic layout (base64-encoded XDR ScVals), verified against
+   * `contracts/escrow/src/events.rs` in trust-link-contract:
+   *   topics[0] = Symbol("Escrow" | "Dispute")
+   *   topics[1] = Symbol("Funded" | "Shipped" | "Completed" | "Delivered" |
+   *                      "Released" | "Canceled" | "Raised" | "Resolved")
+   *   topics[2] = Address (an actor, e.g. the seller) — unused here
    *
    * Mapping:
    *   ("Escrow",  "Funded")   → EscrowFunded
@@ -365,7 +434,13 @@ export class SorobanPollerService implements OnModuleInit, OnModuleDestroy {
    *   ("Escrow",  "Completed")→ EscrowCompleted
    *   ("Dispute", "Raised")   → DisputeRaised
    *   ("Dispute", "Resolved") → DisputeResolved
-   *   ("Auto",    "Released") → AutoReleased
+   *   ("Escrow",  "Released") → AutoReleased   (see EVENT_TYPE_OVERRIDES)
+   *
+   * Note the last one. This previously documented `("Auto", "Released")`, a
+   * topic pair the contract never emits: `emit_auto_released` publishes
+   * `(symbol_short!("Escrow"), symbol_short!("Released"), seller)`. Naive
+   * concatenation yields "EscrowReleased", which `syncStateFromChain` has no
+   * case for, so a confirmed auto-release would have been dropped.
    *
    * Issue #554 — two distinct failure classes, handled differently:
    *
@@ -387,6 +462,19 @@ export class SorobanPollerService implements OnModuleInit, OnModuleDestroy {
    *      (returns normally) so the cursor can move on.
    */
   private async processEvent(raw: SorobanRpcEvent): Promise<void> {
+    return this.traced(
+      'stellar.soroban.process_event',
+      {
+        'trustlink.stellar.event_type': raw.type,
+        'trustlink.stellar.ledger': raw.ledger,
+        'trustlink.stellar.tx_cursor': raw.pagingToken,
+        'trustlink.stellar.network': this.networkLabel(),
+      },
+      () => this.processEventInternal(raw),
+    );
+  }
+
+  private async processEventInternal(raw: SorobanRpcEvent): Promise<void> {
     const rpcEvent: RawSorobanEvent = {
       contractId: raw.contractId,
       type: raw.type,
@@ -395,7 +483,7 @@ export class SorobanPollerService implements OnModuleInit, OnModuleDestroy {
       value: raw.value,
     };
 
-    const parsed = this.blockchainListener.parseEvent(rpcEvent);
+    const parsed = await this.blockchainListener.parseEvent(rpcEvent);
     if (!parsed) {
       await this.deadLetter(raw, null, 'event payload could not be parsed');
       return;
@@ -416,17 +504,38 @@ export class SorobanPollerService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    const eventType = `${topic0}${topic1}`;
+    const rawEventType = `${topic0}${topic1}`;
+    const eventType = EVENT_TYPE_OVERRIDES[rawEventType] ?? rawEventType;
 
-    // The contract value payload is expected to contain { escrowId, ...extras }.
+    // The contract payload is a #[contracttype] struct whose id field is
+    // `escrow_id: u64`, not `escrowId: string`. Across the XDR boundary a u64
+    // arrives as a number, a bigint, or a decimal string depending on
+    // magnitude and decoder, so accept all three and normalise to bigint.
     const data = parsed.data as Record<string, unknown> | null;
-    const escrowId = typeof data?.escrowId === 'string' ? data.escrowId : null;
+    const contractEscrowId = toContractEscrowId(data?.escrow_id);
+
+    if (contractEscrowId === null) {
+      await this.deadLetter(
+        raw,
+        null,
+        `event "${eventType}" payload is missing a usable escrow_id ` +
+          `(got ${JSON.stringify(data?.escrow_id ?? null)})`,
+      );
+      return;
+    }
+
+    // The contract mints its own u64; the backend mints a UUID. Escrow.
+    // contractEscrowId is the join. An unmapped id is not retryable, so it is
+    // dead-lettered rather than left to spin.
+    const escrowId =
+      await this.escrowService.findIdByContractEscrowId(contractEscrowId);
 
     if (!escrowId) {
       await this.deadLetter(
         raw,
         null,
-        `event "${eventType}" payload is missing escrowId`,
+        `event "${eventType}" references contract escrow ` +
+          `${contractEscrowId.toString()}, which maps to no backend escrow`,
       );
       return;
     }
@@ -436,7 +545,11 @@ export class SorobanPollerService implements OnModuleInit, OnModuleDestroy {
         eventType,
         escrowId,
         trackingId:
-          typeof data?.trackingId === 'string' ? data.trackingId : undefined,
+          typeof data?.tracking_id === 'string'
+            ? data.tracking_id
+            : typeof data?.trackingId === 'string'
+              ? data.trackingId
+              : undefined,
         txHash: typeof data?.txHash === 'string' ? data.txHash : undefined,
         reason: typeof data?.reason === 'string' ? data.reason : undefined,
       });
@@ -528,12 +641,12 @@ export class SorobanPollerService implements OnModuleInit, OnModuleDestroy {
     }
 
     if (stellarNetwork === 'MAINNET') {
-      return 'https://mainnet.stellar.validationcloud.io/v1/soroban/rpc';
+      return STELLAR_RPC_URLS.MAINNET;
     }
 
     this.logger.warn(
-      `SorobanPollerService: SOROBAN_RPC_URL not set — defaulting to public testnet RPC ${DEFAULT_TESTNET_RPC_URL}`,
+      `SorobanPollerService: SOROBAN_RPC_URL not set — defaulting to public testnet RPC ${STELLAR_RPC_URLS.TESTNET}`,
     );
-    return DEFAULT_TESTNET_RPC_URL;
+    return STELLAR_RPC_URLS.TESTNET;
   }
 }

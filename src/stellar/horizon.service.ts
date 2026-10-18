@@ -1,16 +1,13 @@
 import { Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
 import { ConfigService } from '../config/config.service';
+import { STELLAR_HORIZON_URLS } from './stellar-endpoints';
+import { TracingService } from '../tracing/tracing.service';
 
-export const DEFAULT_HORIZON_URL = 'https://horizon-testnet.stellar.org';
-
-const HORIZON_URLS: Record<'TESTNET' | 'MAINNET', string> = {
-  TESTNET: DEFAULT_HORIZON_URL,
-  MAINNET: 'https://horizon.stellar.org',
-};
+export const DEFAULT_HORIZON_URL = STELLAR_HORIZON_URLS.TESTNET;
 
 /** Matches the timeout the readiness probe previously used inline in AppController. */
-const HEALTH_CHECK_TIMEOUT_MS = 150;
+export const HEALTH_CHECK_TIMEOUT_MS = 150;
 
 export interface HorizonHealth {
   status: 'ok' | 'down';
@@ -28,13 +25,43 @@ export class HorizonService {
   readonly horizonUrl: string;
   private readonly pollIntervalMs = 100;
 
-  constructor(private readonly config: ConfigService) {
+  constructor(
+    private readonly config: ConfigService,
+    private readonly tracing: TracingService,
+  ) {
     const configured = this.config.get('STELLAR_HORIZON_URL');
     const network = this.config.get('STELLAR_NETWORK');
     this.horizonUrl =
-      configured || HORIZON_URLS[network] || DEFAULT_HORIZON_URL;
+      configured || STELLAR_HORIZON_URLS[network] || DEFAULT_HORIZON_URL;
   }
 
+  /**
+   * Runs `fn` inside a Stellar span.
+   *
+   * Spans here carry identifiers such as the contract escrow id, the network,
+   * and the contract function. Signing secrets, secret keys and full
+   * transaction envelopes are never recorded as attributes.
+   */
+  private traced<T>(
+    name: string,
+    attributes: Record<string, string | number | boolean>,
+    fn: () => T | Promise<T>,
+  ): Promise<T> {
+    return this.tracing.withSpan(name, { attributes }, fn);
+  }
+
+  /**
+   * Returns the effective Horizon base URL (no trailing slash) this service
+   * talks to.
+   *
+   * Resolved once in the constructor: `STELLAR_HORIZON_URL` if set, otherwise
+   * the default for `STELLAR_NETWORK` (testnet/mainnet), otherwise the
+   * testnet URL. Stable for the process lifetime — callers building their
+   * own Horizon requests should use this rather than re-deriving the URL, so
+   * a URL override is honoured everywhere. Also exposed as the public
+   * `horizonUrl` field; this getter exists for call sites that prefer a
+   * method.
+   */
   getHorizonUrl(): string {
     return this.horizonUrl;
   }
@@ -44,7 +71,21 @@ export class HorizonService {
    * Horizon root. Folded in from AppController's ad-hoc checkHorizon
    * (issue #562) so the check is unit-testable in isolation.
    */
+  private networkLabel(): string {
+    return this.config.get('STELLAR_NETWORK') === 'MAINNET'
+      ? 'MAINNET'
+      : 'TESTNET';
+  }
+
   async checkHealth(): Promise<HorizonHealth> {
+    return this.traced(
+      'stellar.horizon.health',
+      { 'trustlink.stellar.network': this.networkLabel() },
+      () => this.checkHealthInternal(),
+    );
+  }
+
+  private async checkHealthInternal(): Promise<HorizonHealth> {
     const controller = new AbortController();
     const timeout = setTimeout(
       () => controller.abort(),
@@ -72,10 +113,42 @@ export class HorizonService {
     }
   }
 
+  /**
+   * Polls Horizon for `transactionHash` until it reports at least
+   * `targetConfirmations` (default 3) or `timeoutMs` (default 10s) elapses.
+   *
+   * Resolves only on success. **Throws `Error('Horizon confirmation timed
+   * out')` on timeout** — including the case where the transaction never
+   * appears (a 404 is swallowed and retried, not distinguished from "not yet
+   * confirmed"). Polls every ~100ms; transient request errors are ignored
+   * until the deadline. Safe to call again with the same hash after a
+   * timeout — it is a read-only poll and holds no state.
+   */
   async pollConfirmation(
     transactionHash: string,
     targetConfirmations = 3,
     timeoutMs = 10000,
+  ): Promise<{ confirmed: boolean; confirmations: number; hash: string }> {
+    return this.traced(
+      'stellar.horizon.confirm',
+      {
+        'trustlink.stellar.tx_hash': transactionHash,
+        'trustlink.stellar.network': this.networkLabel(),
+        'trustlink.stellar.target_confirmations': targetConfirmations,
+      },
+      () =>
+        this.pollConfirmationInternal(
+          transactionHash,
+          targetConfirmations,
+          timeoutMs,
+        ),
+    );
+  }
+
+  private async pollConfirmationInternal(
+    transactionHash: string,
+    targetConfirmations: number,
+    timeoutMs: number,
   ): Promise<{ confirmed: boolean; confirmations: number; hash: string }> {
     const start = Date.now();
 

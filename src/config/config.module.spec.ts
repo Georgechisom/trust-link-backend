@@ -52,6 +52,7 @@ const EMPTY_STRING = '';
 const VALID_ENV = {
   DATABASE_URL: 'postgresql://test:test@localhost:5432/test',
   SEP10_JWT_SECRET: 'test-jwt-secret-32-characters-long!!',
+  PRESIGN_SECRET: 'test-presign-secret-64hexcharacters-for-hmac',
   SYSTEM_SIGNER_SECRET: VALID_SECRET_KEY,
   SEP10_SIGNING_SECRET: ANOTHER_VALID_SECRET,
   ADMIN_ADDRESS: VALID_PUBLIC_KEY,
@@ -652,5 +653,359 @@ describe('ConfigModule — Stellar Key Validation', () => {
       expect(error).toBeDefined();
       expect(error?.message).toContain('SYSTEM_SIGNER_SECRET');
     });
+  });
+
+  describe('PRESIGN_SECRET — required presign HMAC secret', () => {
+    it('accepts a configured PRESIGN_SECRET', () => {
+      const { error, value } = configValidationSchema.validate(
+        { ...VALID_ENV },
+        VALIDATE_OPTIONS,
+      );
+
+      expect(error).toBeUndefined();
+      expect(value.PRESIGN_SECRET).toBe(VALID_ENV.PRESIGN_SECRET);
+    });
+
+    it('rejects a missing PRESIGN_SECRET rather than falling back', () => {
+      const { error } = configValidationSchema.validate(
+        { ...VALID_ENV, PRESIGN_SECRET: undefined },
+        VALIDATE_OPTIONS,
+      );
+
+      expect(error).toBeDefined();
+      expect(error?.message).toContain('PRESIGN_SECRET');
+    });
+
+    it('error messages for a missing PRESIGN_SECRET name the variable and explain why', () => {
+      const { error } = configValidationSchema.validate(
+        { ...VALID_ENV, PRESIGN_SECRET: undefined },
+        VALIDATE_OPTIONS,
+      );
+
+      expect(error?.message).toContain('PRESIGN_SECRET');
+      expect(error?.message.toLowerCase()).toContain('required');
+    });
+
+    it('refuses to boot when PRESIGN_SECRET is unreachable', async () => {
+      await expect(
+        buildConfigService({
+          ...VALID_ENV,
+          PRESIGN_SECRET: undefined,
+        }),
+      ).rejects.toThrow(/PRESIGN_SECRET/);
+    });
+  });
+
+  describe('API_BASE_URL — base URL validation', () => {
+    it('accepts a valid URI', () => {
+      const { error, value } = configValidationSchema.validate(
+        { ...VALID_ENV, API_BASE_URL: 'https://staging.trust-link.io' },
+        VALIDATE_OPTIONS,
+      );
+
+      expect(error).toBeUndefined();
+      expect(value.API_BASE_URL).toBe('https://staging.trust-link.io');
+    });
+
+    it('defaults to http://localhost:3000 when unset', () => {
+      const { error, value } = configValidationSchema.validate(
+        { ...VALID_ENV },
+        VALIDATE_OPTIONS,
+      );
+
+      expect(error).toBeUndefined();
+      expect(value.API_BASE_URL).toBe('http://localhost:3000');
+    });
+
+    it('rejects a malformed URI value', () => {
+      const { error } = configValidationSchema.validate(
+        { ...VALID_ENV, API_BASE_URL: 'not-a-valid-uri' },
+        VALIDATE_OPTIONS,
+      );
+
+      expect(error).toBeDefined();
+      expect(error?.message).toContain('API_BASE_URL');
+    });
+  });
+
+  describe('FRONTEND_URL — payment links (#837)', () => {
+    it('accepts a configured frontend URI', () => {
+      const { error, value } = configValidationSchema.validate(
+        { ...VALID_ENV, FRONTEND_URL: 'https://shop.example.com/' },
+        VALIDATE_OPTIONS,
+      );
+
+      expect(error).toBeUndefined();
+      expect(value.FRONTEND_URL).toBe('https://shop.example.com/');
+    });
+
+    it('defaults to localhost outside production', () => {
+      const { error, value } = configValidationSchema.validate(
+        { ...VALID_ENV, FRONTEND_URL: undefined },
+        VALIDATE_OPTIONS,
+      );
+
+      expect(error).toBeUndefined();
+      expect(value.FRONTEND_URL).toBe('http://localhost:3000');
+    });
+
+    it('requires FRONTEND_URL in production', () => {
+      const { error } = configValidationSchema.validate(
+        { ...VALID_ENV, NODE_ENV: 'production', FRONTEND_URL: undefined },
+        VALIDATE_OPTIONS,
+      );
+
+      expect(error?.message).toContain(
+        'FRONTEND_URL is required in production',
+      );
+    });
+
+    it('rejects an invalid frontend URI', () => {
+      const { error } = configValidationSchema.validate(
+        { ...VALID_ENV, FRONTEND_URL: 'not-a-url' },
+        VALIDATE_OPTIONS,
+      );
+
+      expect(error?.message).toContain('FRONTEND_URL');
+    });
+  });
+
+  describe('EVIDENCE_STORAGE_BASE_URL — evidence public URLs', () => {
+    it('accepts a configured storage URI', () => {
+      const { error, value } = configValidationSchema.validate(
+        {
+          ...VALID_ENV,
+          EVIDENCE_STORAGE_BASE_URL: 'https://storage.example.com/',
+        },
+        VALIDATE_OPTIONS,
+      );
+
+      expect(error).toBeUndefined();
+      expect(value.EVIDENCE_STORAGE_BASE_URL).toBe(
+        'https://storage.example.com/',
+      );
+    });
+
+    it('defaults to localhost outside production', () => {
+      const { error, value } = configValidationSchema.validate(
+        { ...VALID_ENV, EVIDENCE_STORAGE_BASE_URL: undefined },
+        VALIDATE_OPTIONS,
+      );
+
+      expect(error).toBeUndefined();
+      expect(value.EVIDENCE_STORAGE_BASE_URL).toBe('http://localhost:9000');
+    });
+
+    it('requires EVIDENCE_STORAGE_BASE_URL in production', () => {
+      const { error } = configValidationSchema.validate(
+        {
+          ...VALID_ENV,
+          NODE_ENV: 'production',
+          EVIDENCE_STORAGE_BASE_URL: undefined,
+        },
+        VALIDATE_OPTIONS,
+      );
+
+      expect(error?.message).toContain(
+        'EVIDENCE_STORAGE_BASE_URL is required in production',
+      );
+    });
+
+    it('rejects an invalid storage URI', () => {
+      const { error } = configValidationSchema.validate(
+        { ...VALID_ENV, EVIDENCE_STORAGE_BASE_URL: 'not-a-url' },
+        VALIDATE_OPTIONS,
+      );
+
+      expect(error?.message).toContain('EVIDENCE_STORAGE_BASE_URL');
+    });
+  });
+
+  describe('TWILIO_FROM_NUMBER — SMS sender (#838)', () => {
+    it('requires a valid E.164 sender when a Twilio account is configured', () => {
+      const { error, value } = configValidationSchema.validate(
+        {
+          ...VALID_ENV,
+          TWILIO_ACCOUNT_SID: 'AC123',
+          TWILIO_FROM_NUMBER: '+15551234567',
+        },
+        VALIDATE_OPTIONS,
+      );
+
+      expect(error).toBeUndefined();
+      expect(value.TWILIO_FROM_NUMBER).toBe('+15551234567');
+    });
+
+    it('rejects a configured account without a sender', () => {
+      const { error } = configValidationSchema.validate(
+        { ...VALID_ENV, TWILIO_ACCOUNT_SID: 'AC123' },
+        VALIDATE_OPTIONS,
+      );
+
+      expect(error?.message).toContain('TWILIO_FROM_NUMBER is required');
+    });
+
+    it('rejects a sender that is not an E.164 number', () => {
+      const { error } = configValidationSchema.validate(
+        {
+          ...VALID_ENV,
+          TWILIO_ACCOUNT_SID: 'AC123',
+          TWILIO_FROM_NUMBER: '555-123-4567',
+        },
+        VALIDATE_OPTIONS,
+      );
+
+      expect(error?.message).toContain('TWILIO_FROM_NUMBER must be an E.164');
+    });
+  });
+});
+
+/**
+ * Issue #839 — email configuration.
+ *
+ * `SENDGRID_FROM_EMAIL` must be present whenever a SendGrid key is set, and
+ * every template id must be a real dynamic template id (`d-` + 32 hex). Both
+ * are validated here so a misconfiguration is reported when the process boots
+ * rather than as a rejected API call on every notification.
+ */
+describe('SendGrid email configuration (#839)', () => {
+  const FROM_EMAIL = 'notifications@example.com';
+  const VALID_TEMPLATE = 'd-1234567890abcdef1234567890abcdef';
+
+  const ALL_TEMPLATE_KEYS = [
+    'SENDGRID_TEMPLATE_FUNDED',
+    'SENDGRID_TEMPLATE_SHIPPED',
+    'SENDGRID_TEMPLATE_DELIVERED',
+    'SENDGRID_TEMPLATE_DISPUTED',
+    'SENDGRID_TEMPLATE_COMPLETED',
+    'SENDGRID_TEMPLATE_REFUNDED',
+  ] as const;
+
+  function envWithEmail(extra: Record<string, string>): Record<string, string> {
+    return {
+      ...VALID_ENV,
+      SENDGRID_API_KEY: 'SG.test-api-key',
+      SENDGRID_FROM_EMAIL: FROM_EMAIL,
+      ...ALL_TEMPLATE_KEYS.reduce<Record<string, string>>((acc, key) => {
+        acc[key] = VALID_TEMPLATE;
+        return acc;
+      }, {}),
+      ...extra,
+    };
+  }
+
+  it('accepts a complete, valid email configuration', () => {
+    const { error } = configValidationSchema.validate(
+      envWithEmail({}),
+      VALIDATE_OPTIONS,
+    );
+
+    expect(error).toBeUndefined();
+  });
+
+  it('rejects a SendGrid key with no sender address', () => {
+    const env = envWithEmail({});
+    delete env.SENDGRID_FROM_EMAIL;
+
+    const { error } = configValidationSchema.validate(env, VALIDATE_OPTIONS);
+
+    expect(error).toBeDefined();
+    expect(error?.message).toContain('SENDGRID_FROM_EMAIL');
+    expect(error?.message).toContain('required');
+  });
+
+  it('rejects a sender address that is not an email', () => {
+    const { error } = configValidationSchema.validate(
+      envWithEmail({ SENDGRID_FROM_EMAIL: 'not-an-email' }),
+      VALIDATE_OPTIONS,
+    );
+
+    expect(error).toBeDefined();
+    expect(error?.message).toContain('SENDGRID_FROM_EMAIL');
+  });
+
+  it('allows a sender address to be set with no API key (email disabled)', () => {
+    const { error } = configValidationSchema.validate(
+      { ...VALID_ENV, SENDGRID_FROM_EMAIL: FROM_EMAIL },
+      VALIDATE_OPTIONS,
+    );
+
+    expect(error).toBeUndefined();
+  });
+
+  it('allows an API key with no sender to validate as an error, not a crash', () => {
+    expect(() =>
+      configValidationSchema.validate(
+        { ...VALID_ENV, SENDGRID_API_KEY: 'SG.test-api-key' },
+        VALIDATE_OPTIONS,
+      ),
+    ).not.toThrow();
+  });
+
+  it.each(ALL_TEMPLATE_KEYS)(
+    'accepts a well-formed dynamic template id for %s',
+    (key) => {
+      const { error } = configValidationSchema.validate(
+        envWithEmail({ [key]: VALID_TEMPLATE }),
+        VALIDATE_OPTIONS,
+      );
+
+      expect(error).toBeUndefined();
+    },
+  );
+
+  it.each(ALL_TEMPLATE_KEYS)('rejects a malformed %s', (key) => {
+    const { error } = configValidationSchema.validate(
+      envWithEmail({ [key]: 'trustlink-funded' }),
+      VALIDATE_OPTIONS,
+    );
+
+    expect(error).toBeDefined();
+    expect(error?.message).toContain(key);
+  });
+
+  it('rejects a template id with too few hex characters', () => {
+    const { error } = configValidationSchema.validate(
+      envWithEmail({ SENDGRID_TEMPLATE_FUNDED: 'd-1234' }),
+      VALIDATE_OPTIONS,
+    );
+
+    expect(error).toBeDefined();
+    expect(error?.message).toContain('SENDGRID_TEMPLATE_FUNDED');
+  });
+
+  it('rejects a template id missing the d- prefix', () => {
+    const { error } = configValidationSchema.validate(
+      envWithEmail({
+        SENDGRID_TEMPLATE_SHIPPED: '1234567890abcdef1234567890abcdef',
+      }),
+      VALIDATE_OPTIONS,
+    );
+
+    expect(error).toBeDefined();
+    expect(error?.message).toContain('SENDGRID_TEMPLATE_SHIPPED');
+  });
+
+  it('leaves a template id optional so one bad key does not block boot for the rest', () => {
+    // An absent id is reported at startup by NotificationsService rather than
+    // being a hard validation failure, so disabling one type is possible.
+    const env = envWithEmail({});
+    delete env.SENDGRID_TEMPLATE_REFUNDED;
+
+    const { error } = configValidationSchema.validate(env, VALIDATE_OPTIONS);
+
+    expect(error).toBeUndefined();
+  });
+
+  it('rejects uppercase hex in a template id', () => {
+    const { error } = configValidationSchema.validate(
+      envWithEmail({
+        SENDGRID_TEMPLATE_COMPLETED: 'd-ABCDEF7890ABCDEF1234567890ABCDEF',
+      }),
+      VALIDATE_OPTIONS,
+    );
+
+    expect(error).toBeDefined();
+    expect(error?.message).toContain('SENDGRID_TEMPLATE_COMPLETED');
   });
 });

@@ -6,6 +6,7 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
+import { THROTTLE_WINDOW_MS } from '../../common/security/throttle.config';
 import { JwtGuard } from '../../auth/guards/jwt.guard';
 import { AdminGuard } from '../guards/admin.guard';
 import { QueueDashboardService } from './queue-dashboard.service';
@@ -46,10 +47,14 @@ export class QueueDashboardController {
    * @authentication Requires valid SEP-10 JWT (admin only)
    */
   @ApiOperation({ summary: 'Get real-time BullMQ queue dashboard data' })
-  @ApiResponse({ status: 200, description: 'Queue counts returned.' })
+  @ApiResponse({
+    status: 200,
+    description: 'Queue counts returned.',
+    type: QueuesDashboardDto,
+  })
   @ApiResponse({ status: 401, description: 'Unauthorized.' })
   @ApiResponse({ status: 403, description: 'Admin access required.' })
-  @Throttle({ auth: { limit: 20, ttl: 60000 } })
+  @Throttle({ default: { limit: 20, ttl: THROTTLE_WINDOW_MS } })
   @Get()
   getDashboard(): Promise<QueuesDashboardDto> {
     return this.dashboardService.getDashboard();

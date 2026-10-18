@@ -22,6 +22,7 @@ import { S3PresignService } from '../../src/common/services/s3-presign.service';
 import { ContractService } from '../../src/stellar/contract.service';
 import { CacheService } from '../../src/cache/cache.service';
 import { ensureVendors } from '../prisma-helpers';
+import { TracingService } from '../../src/tracing/tracing.service';
 
 describe('Cross-vendor escrow access (issue #272)', () => {
   let app: INestApplication;
@@ -77,6 +78,7 @@ describe('Cross-vendor escrow access (issue #272)', () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
       controllers: [EscrowController],
       providers: [
+        TracingService,
         EscrowService,
         BuyerDisputeService,
         EscrowRepository,

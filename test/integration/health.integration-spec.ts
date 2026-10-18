@@ -7,6 +7,8 @@ import { ConfigService } from '../../src/config/config.service';
 import { PrismaService } from '../../src/prisma/prisma.service';
 import { CacheService } from '../../src/cache/cache.service';
 import { HorizonService } from '../../src/stellar/horizon.service';
+import { SorobanHealthService } from '../../src/stellar/soroban-health.service';
+import { TracingService } from '../../src/tracing/tracing.service';
 
 const mockFetch = jest.fn();
 
@@ -46,6 +48,7 @@ describe('GET /health integration (issue #55)', () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
       controllers: [AppController],
       providers: [
+        TracingService,
         AppService,
         { provide: ConfigService, useValue: mockConfigService },
         { provide: PrismaService, useValue: prisma },
@@ -54,6 +57,12 @@ describe('GET /health integration (issue #55)', () => {
         // driven through the mocked global.fetch, and #562 moved that call out
         // of AppController and into HorizonService.
         HorizonService,
+        // #841 — The readiness probe also checks the Soroban RPC. Bound here
+        // with no STELLAR_SERVER behind it, which the real service treats as
+        // "nothing to probe" (ok), so these existing scenarios stay focused on
+        // the database and Horizon. The RPC-down path is covered by
+        // app.controller.spec.ts, which injects the service directly.
+        SorobanHealthService,
       ],
     }).compile();
 
@@ -87,6 +96,7 @@ describe('GET /health integration (issue #55)', () => {
           status: expect.stringMatching(/^(ok|down)$/),
           db: expect.stringMatching(/^(ok|down)$/),
           horizon: expect.stringMatching(/^(ok|down)$/),
+          soroban: expect.stringMatching(/^(ok|down)$/),
           timestamp: expect.any(String),
           environment: expect.any(String),
           version: expect.any(String),
@@ -114,6 +124,8 @@ describe('GET /health integration (issue #55)', () => {
         'status',
         'db',
         'horizon',
+        // #841 — documented component, see R-OB-05 in SPECIFICATION.md.
+        'soroban',
         'redis',
         'timestamp',
         'environment',

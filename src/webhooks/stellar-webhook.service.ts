@@ -3,14 +3,13 @@ import {
   Injectable,
   InternalServerErrorException,
   Logger,
-  Optional,
   UnauthorizedException,
 } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { ConfigService } from '../config/config.service';
 import { EscrowRepository } from '../escrow/escrow.repository';
 import { NotificationsService } from '../notifications/notifications.service';
-import { PrismaService } from '../prisma/prisma.service';
+import { StellarWebhookRepository } from './stellar-webhook.repository';
 import { StellarWebhookDto } from './dto/stellar-webhook.dto';
 
 /**
@@ -29,14 +28,12 @@ import { StellarWebhookDto } from './dto/stellar-webhook.dto';
 @Injectable()
 export class StellarWebhookService {
   private readonly logger = new Logger(StellarWebhookService.name);
-  private readonly processedIds = new Set<string>();
 
   constructor(
     private readonly configService: ConfigService,
     private readonly escrowRepository: EscrowRepository,
     private readonly notificationsService: NotificationsService,
-    @Optional()
-    private readonly prisma?: PrismaService,
+    private readonly webhookRepository: StellarWebhookRepository,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -59,11 +56,7 @@ export class StellarWebhookService {
       this.verifySignature(rawBody, signature);
 
       // --- Idempotency check (DB-backed, survives restarts) ------------------
-      const duplicate = this.prisma
-        ? await this.prisma.processedWebhookEvent.findUnique({
-            where: { operationId: dto.id },
-          })
-        : this.processedIds.has(dto.id);
+      const duplicate = await this.webhookRepository.isProcessed(dto.id);
       if (duplicate) {
         this.logger.log(
           JSON.stringify({
@@ -75,25 +68,13 @@ export class StellarWebhookService {
       }
 
       // Persist before processing so concurrent Horizon retries are blocked.
-      if (this.prisma) {
-        await this.prisma.processedWebhookEvent.create({
-          data: { operationId: dto.id },
-        });
-      } else {
-        this.processedIds.add(dto.id);
-      }
+      await this.webhookRepository.markProcessed(dto.id);
 
       try {
         await this.processEvent(dto);
       } catch (err) {
         // Roll back the cursor so the event can be retried on the next delivery.
-        if (this.prisma) {
-          await this.prisma.processedWebhookEvent.delete({
-            where: { operationId: dto.id },
-          });
-        } else {
-          this.processedIds.delete(dto.id);
-        }
+        await this.webhookRepository.unmarkProcessed(dto.id);
         throw err;
       }
 
@@ -114,14 +95,22 @@ export class StellarWebhookService {
   }
 
   /**
-   * Programmatic processing for replayed operations (no signature verification).
-   * Returns true when processed, false when skipped (duplicate).
+   * Processes one already-trusted Stellar operation (a replay / admin
+   * backfill path) with **no HMAC signature check** — unlike
+   * {@link handleEvent}, which is the signed inbound-webhook entry point.
+   * Only call this with a `dto` whose provenance is already trusted.
+   *
+   * Idempotent by `dto.id` against the same persisted
+   * `StellarWebhookRepository` cursor {@link handleEvent} uses (issue #922):
+   * an operation the webhook already processed is skipped on replay rather
+   * than processed again. The id is marked processed *before* processing and
+   * **rolled back on failure**, so a `processEvent` error both rejects and
+   * leaves the id replayable — a retry will re-attempt it rather than skip it.
    */
-  /** Processes replayed operations without signature checks while guarding duplicates. */
   async processOperationDto(
     dto: StellarWebhookDto,
   ): Promise<{ processed: boolean; skipped?: boolean }> {
-    if (this.processedIds.has(dto.id)) {
+    if (await this.webhookRepository.isProcessed(dto.id)) {
       this.logger.log(
         JSON.stringify({
           msg: 'stellar.replay.duplicate',
@@ -131,11 +120,11 @@ export class StellarWebhookService {
       return { processed: false, skipped: true };
     }
 
-    this.processedIds.add(dto.id);
+    await this.webhookRepository.markProcessed(dto.id);
     try {
       await this.processEvent(dto);
     } catch (err) {
-      this.processedIds.delete(dto.id);
+      await this.webhookRepository.unmarkProcessed(dto.id);
       this.logger.error(
         JSON.stringify({
           msg: 'stellar.replay.processing_failed',
@@ -323,7 +312,14 @@ export class StellarWebhookService {
         escrow.id,
         'FUNDED',
       );
-      await this.notificationsService.notifyFunded(updatedEscrow);
+      // Not awaited: delivery retries with backoff and must not hold up the
+      // webhook response.
+      this.notificationsService.notifyFunded(updatedEscrow).catch((error) => {
+        this.logger.error(
+          `Failed to send funded notification for escrow ${updatedEscrow.id}`,
+          error,
+        );
+      });
 
       this.logger.log(
         JSON.stringify({

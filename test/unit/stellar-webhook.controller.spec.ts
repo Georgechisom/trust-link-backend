@@ -25,11 +25,52 @@ import { Test, TestingModule } from '@nestjs/testing';
 import * as crypto from 'crypto';
 import * as express from 'express';
 import request from 'supertest';
+import { BadRequestException } from '@nestjs/common';
+import type { Request } from 'express';
 import { StellarWebhookController } from '../../src/webhooks/stellar-webhook.controller';
 import { StellarWebhookService } from '../../src/webhooks/stellar-webhook.service';
 import { ConfigService } from '../../src/config/config.service';
 import { EscrowRepository } from '../../src/escrow/escrow.repository';
 import { NotificationsService } from '../../src/notifications/notifications.service';
+import { StellarWebhookRepository } from '../../src/webhooks/stellar-webhook.repository';
+
+describe('StellarWebhookController raw body extraction', () => {
+  it('passes the captured Buffer straight through to the service for signature verification', async () => {
+    const handleEvent = jest.fn().mockResolvedValue({ received: true });
+    const controller = new StellarWebhookController({
+      handleEvent,
+    } as unknown as StellarWebhookService);
+    const rawBody = Buffer.from('{"id":"op-1"}', 'utf8');
+    const dto = { id: 'op-1' } as never;
+
+    const result = await controller.handleStellarWebhook(
+      { rawBody } as unknown as Request,
+      'sig',
+      dto,
+    );
+
+    expect(result).toEqual({ received: true });
+    expect(handleEvent).toHaveBeenCalledTimes(1);
+    expect(handleEvent.mock.calls[0][0]).toBe(rawBody);
+    expect(handleEvent).toHaveBeenCalledWith(rawBody, 'sig', dto);
+  });
+
+  it('rejects a request whose raw body was not captured as a Buffer', async () => {
+    const handleEvent = jest.fn();
+    const controller = new StellarWebhookController({
+      handleEvent,
+    } as unknown as StellarWebhookService);
+
+    await expect(
+      controller.handleStellarWebhook(
+        { rawBody: '{"id":"op-1"}' } as unknown as Request,
+        'sig',
+        { id: 'op-1' } as never,
+      ),
+    ).rejects.toThrow(BadRequestException);
+    expect(handleEvent).not.toHaveBeenCalled();
+  });
+});
 
 describe('StellarWebhookController (issue #574)', () => {
   let app: INestApplication;
@@ -37,6 +78,25 @@ describe('StellarWebhookController (issue #574)', () => {
   let notificationsService: jest.Mocked<NotificationsService>;
 
   const WEBHOOK_SECRET = 'unit-test-webhook-secret';
+
+  /**
+   * Set-backed stand-in for the persisted webhook cursor, so the real
+   * (unmocked) `StellarWebhookService` can dedupe across requests.
+   */
+  function makeInMemoryWebhookRepository() {
+    const processed = new Set<string>();
+    return {
+      isProcessed: jest.fn((id: string) => Promise.resolve(processed.has(id))),
+      markProcessed: jest.fn((id: string) => {
+        processed.add(id);
+        return Promise.resolve();
+      }),
+      unmarkProcessed: jest.fn((id: string) => {
+        processed.delete(id);
+        return Promise.resolve();
+      }),
+    };
+  }
 
   const sign = (body: Buffer, secret: string): string =>
     crypto.createHmac('sha256', secret).update(body).digest('hex');
@@ -62,6 +122,10 @@ describe('StellarWebhookController (issue #574)', () => {
         },
         { provide: EscrowRepository, useValue: escrowRepository },
         { provide: NotificationsService, useValue: notificationsService },
+        {
+          provide: StellarWebhookRepository,
+          useValue: makeInMemoryWebhookRepository(),
+        },
       ],
     }).compile();
 

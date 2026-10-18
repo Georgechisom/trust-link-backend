@@ -5,6 +5,7 @@ import {
   UseGuards,
   HttpCode,
   HttpStatus,
+  UnauthorizedException,
 } from '@nestjs/common';
 import {
   ApiBearerAuth,
@@ -14,6 +15,7 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
+import { THROTTLE_WINDOW_MS } from '../../common/security/throttle.config';
 import { CurrentUser } from '../../auth/decorators/current-user.decorator';
 import type { AuthUser } from '../../auth/auth-user';
 import { JwtGuard } from '../../auth/guards/jwt.guard';
@@ -44,18 +46,25 @@ export class AnalyticsController {
   @ApiResponse({
     status: 200,
     description: 'Vendor transaction statistics returned.',
+    type: AnalyticsStatsResponse,
   })
   @ApiResponse({ status: 401, description: 'Unauthorized.' })
   @ApiResponse({ status: 403, description: 'Forbidden.' })
   @ApiResponse({ status: 429, description: 'Too many requests.' })
   @ApiResponse({ status: 500, description: 'Internal server error.' })
-  @Throttle({ auth: { limit: 20, ttl: 60000 } })
+  @Throttle({ default: { limit: 20, ttl: THROTTLE_WINDOW_MS } })
   @Get()
   @HttpCode(HttpStatus.OK)
   async getTransactionStats(
     @CurrentUser() user?: AuthUser,
   ): Promise<AnalyticsStatsResponse> {
-    return this.analyticsService.getTransactionStats(user!.address);
+    // `CurrentUser` really can be undefined; assert-and-hope (`user!`) turned
+    // a missing user into a 500 if `JwtGuard` were ever removed or reordered.
+    // Fail as 401 instead (#671).
+    if (!user) {
+      throw new UnauthorizedException();
+    }
+    return this.analyticsService.getTransactionStats(user.address);
   }
 
   /**
@@ -87,12 +96,13 @@ export class AnalyticsController {
   @ApiResponse({
     status: 200,
     description: 'Daily volume chart data returned.',
+    type: ChartDataResponse,
   })
   @ApiResponse({ status: 401, description: 'Unauthorized.' })
   @ApiResponse({ status: 403, description: 'Forbidden.' })
   @ApiResponse({ status: 429, description: 'Too many requests.' })
   @ApiResponse({ status: 500, description: 'Internal server error.' })
-  @Throttle({ auth: { limit: 20, ttl: 60000 } })
+  @Throttle({ default: { limit: 20, ttl: THROTTLE_WINDOW_MS } })
   @Get('chart')
   @HttpCode(HttpStatus.OK)
   async getDailyVolumeChart(
@@ -100,6 +110,10 @@ export class AnalyticsController {
     @Query('timezone') timezoneParam?: string,
     @CurrentUser() user?: AuthUser,
   ): Promise<ChartDataResponse> {
+    if (!user) {
+      throw new UnauthorizedException();
+    }
+
     let days = 30;
     let timezone = 'UTC';
 
@@ -115,7 +129,7 @@ export class AnalyticsController {
     }
 
     return this.analyticsService.getDailyVolumeChart(
-      user!.address,
+      user.address,
       days,
       timezone,
     );

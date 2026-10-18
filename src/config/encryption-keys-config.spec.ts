@@ -14,6 +14,7 @@ const BASE_PROD_ENV = {
     'SAIJDXETR5B7YFPH7SUOISWVBHHSI46JLYFDCWDMEV2L46XAHASPP35C',
   ADMIN_ADDRESS: 'GBEFNNUJ3IRKU2JEAMWBA7YI52HF2GYPHMDXF37T75GHK5KU2Y2QSUAJ',
   SEP10_JWT_SECRET: '12345678901234567890123456789012',
+  PRESIGN_SECRET: 'test-presign-secret-64hexcharacters-for-hmac',
   CONTRACT_ID: 'CB6453...VALID',
   NODE_ENV: 'production',
   STELLAR_WEBHOOK_SECRET: 'secret',
@@ -21,6 +22,8 @@ const BASE_PROD_ENV = {
   SOROBAN_RPC_URL: 'https://soroban-testnet.stellar.org',
   CONTACT_ENCRYPTION_KEY: VALID_KEY_64,
   CREDENTIAL_ENCRYPTION_KEY: VALID_KEY_64,
+  FRONTEND_URL: 'https://app.trustlink.example.com',
+  EVIDENCE_STORAGE_BASE_URL: 'https://storage.trustlink.example.com',
 };
 
 describe('Encryption Keys Config Validation (#564)', () => {

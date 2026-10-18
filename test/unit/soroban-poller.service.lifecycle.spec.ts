@@ -13,6 +13,8 @@
 //   - the RPC URL fallback (SOROBAN_RPC_URL override vs STELLAR_NETWORK
 //     derived default)
 
+import { TracingService } from '../../src/tracing/tracing.service';
+import { createTracingMock } from './tracing-mock';
 import { Test } from '@nestjs/testing';
 import { SorobanPollerService } from '../../src/stellar/soroban-poller.service';
 import { ConfigService } from '../../src/config/config.service';
@@ -34,7 +36,7 @@ function rawEvent(id: string, pagingToken: string) {
 }
 
 function parsedEventFor(
-  escrowId: string,
+  contractEscrowId: bigint | number | string,
   topics: unknown[] = ['Escrow', 'Funded'],
 ) {
   return {
@@ -43,7 +45,9 @@ function parsedEventFor(
     ledger: 100,
     name: 'Funded',
     topics,
-    data: { escrowId },
+    // The contract payload is a #[contracttype] struct carrying
+    // `escrow_id: u64`, not `escrowId: string`.
+    data: { escrow_id: contractEscrowId },
   };
 }
 
@@ -68,6 +72,9 @@ async function buildService(configOverrides: Record<string, string> = {}) {
 
   const escrowService = {
     syncStateFromChain: jest.fn().mockResolvedValue({ skipped: false }),
+    // The poller translates the contract's u64 to the backend UUID before
+    // dispatching; unmapped ids are dead-lettered.
+    findIdByContractEscrowId: jest.fn().mockResolvedValue('escrow-1'),
   } as unknown as jest.Mocked<EscrowService>;
 
   const dlqService = {
@@ -91,6 +98,7 @@ async function buildService(configOverrides: Record<string, string> = {}) {
       { provide: CursorService, useValue: cursorService },
       { provide: EscrowService, useValue: escrowService },
       { provide: DlqService, useValue: dlqService },
+      { provide: TracingService, useValue: createTracingMock().service },
     ],
   }).compile();
 
@@ -277,7 +285,12 @@ describe('SorobanPollerService — event-name derivation (issue #559)', () => {
     ['Escrow', 'Completed', 'EscrowCompleted'],
     ['Dispute', 'Raised', 'DisputeRaised'],
     ['Dispute', 'Resolved', 'DisputeResolved'],
-    ['Auto', 'Released', 'AutoReleased'],
+    // `emit_auto_released` publishes ("Escrow", "Released"), so naive
+    // concatenation gives "EscrowReleased" and syncStateFromChain has no such
+    // case. EVENT_TYPE_OVERRIDES maps it. This previously asserted an
+    // ("Auto", "Released") pair the contract never emits, so the derivation
+    // looked correct while a confirmed auto-release would have been dropped.
+    ['Escrow', 'Released', 'AutoReleased'],
   ];
 
   it.each(cases)(
@@ -286,8 +299,8 @@ describe('SorobanPollerService — event-name derivation (issue #559)', () => {
       const { service, blockchainListener, escrowService } =
         await buildService();
       mockRpcResponse(fetchSpy, [rawEvent('evt-1', 'token-1')]);
-      blockchainListener.parseEvent.mockReturnValueOnce(
-        parsedEventFor('escrow-1', [topic0, topic1]),
+      blockchainListener.parseEvent.mockResolvedValueOnce(
+        parsedEventFor(1n, [topic0, topic1]),
       );
 
       await service.poll();
@@ -307,8 +320,8 @@ describe('SorobanPollerService — event-name derivation (issue #559)', () => {
       cursorService,
     } = await buildService();
     mockRpcResponse(fetchSpy, [rawEvent('evt-1', 'token-1')]);
-    blockchainListener.parseEvent.mockReturnValueOnce(
-      parsedEventFor('escrow-1', [42, null]),
+    blockchainListener.parseEvent.mockResolvedValueOnce(
+      parsedEventFor(1n, [42, null]),
     );
 
     await service.poll();

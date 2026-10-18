@@ -1,6 +1,7 @@
-import { Inject, Injectable, Optional } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import {
   Account,
+  Address,
   Contract,
   Keypair,
   nativeToScVal,
@@ -11,7 +12,12 @@ import {
   xdr,
 } from '@stellar/stellar-sdk';
 import { ConfigService } from '../config/config.service';
-import { DEFAULT_AUTO_RELEASE_MAX_RETRIES } from './contract.constants';
+import { TracingService } from '../tracing/tracing.service';
+import {
+  DEFAULT_AUTO_RELEASE_MAX_RETRIES,
+  TX_CONFIRM_POLL_INTERVAL_MS,
+  TX_CONFIRM_TIMEOUT_MS,
+} from './contract.constants';
 import { ContractCallFailedException } from './contract-call-failed.exception';
 import { STELLAR_SERVER } from './stellar.tokens';
 
@@ -44,25 +50,113 @@ export interface StellarServer {
  * Note on @trustlink/contract-bindings: The @trustlink/contract-bindings package is
  * omitted from package.json, so direct @stellar/stellar-sdk invocation is used.
  */
+/**
+ * Encodes the contract's `ResolutionType` unit enum.
+ *
+ * `#[contracttype] pub enum ResolutionType { Release, Refund }` is a unit
+ * variant enum, which crosses the XDR boundary as a vec holding one symbol,
+ * not as a bare string. It is also PascalCase on-chain, while the backend's
+ * own vocabulary is SCREAMING_CASE, so the value has to be translated as well
+ * as re-shaped.
+ */
+function toResolutionType(resolution: 'RELEASE' | 'REFUND'): xdr.ScVal {
+  return xdr.ScVal.scvVec([
+    nativeToScVal(resolution === 'RELEASE' ? 'Release' : 'Refund', {
+      type: 'symbol',
+    }),
+  ]);
+}
+
 @Injectable()
 export class ContractService {
+  private readonly logger = new Logger(ContractService.name);
+
   constructor(
     @Optional()
     @Inject(STELLAR_SERVER)
     private readonly server?: StellarServer,
     @Optional()
     private readonly config?: ConfigService,
+    @Optional()
+    private readonly tracing?: TracingService,
   ) {}
 
-  /** Submits the on-chain dispute resolution transaction (`resolve_dispute`) and returns its hash. */
+  /**
+   * Runs `fn` inside a span, when tracing is both configured and injected.
+   *
+   * The Stellar client is optional throughout this service, so tracing is
+   * treated the same way: without it the operation simply runs uninstrumented
+   * rather than failing. Signing material is never passed as an attribute.
+   */
+  private traced<T>(
+    name: string,
+    attributes: Record<string, string | number | boolean>,
+    fn: () => T | Promise<T>,
+  ): Promise<T> {
+    if (!this.tracing) {
+      return Promise.resolve(fn());
+    }
+    return this.tracing.withSpan(name, { attributes }, fn);
+  }
+
+  /** Network label recorded on spans, so traces separate mainnet from testnet. */
+  private networkLabel(): string {
+    return this.config?.get('STELLAR_NETWORK') === 'MAINNET'
+      ? 'MAINNET'
+      : 'TESTNET';
+  }
+
+  /**
+   * Submits the on-chain `resolve_dispute(caller, escrow_id: u64, resolution)`
+   * transaction and returns the submitted transaction hash.
+   *
+   * The contract calls `caller.require_auth()` and only accepts the admin as
+   * `caller`, so `callerAddress` must be the configured `ADMIN_ADDRESS` and
+   * the transaction is signed with that key. `resolution` picks who the
+   * escrowed funds go to — `RELEASE` to the vendor, `REFUND` to the buyer.
+   * Not idempotent at this layer: a second call after the dispute is already
+   * resolved fails on-chain. Rejects (and the failure is recorded to the
+   * DLQ) if the submission is not accepted.
+   */
   async resolveDispute(
-    escrowId: string,
+    contractEscrowId: bigint,
     resolution: 'RELEASE' | 'REFUND',
+    callerAddress: string,
+  ): Promise<string> {
+    return this.traced(
+      'stellar.contract.resolve_dispute',
+      {
+        'trustlink.stellar.function': 'resolve_dispute',
+        'trustlink.escrow.contract_id': contractEscrowId.toString(),
+        'trustlink.stellar.resolution': resolution,
+        'trustlink.stellar.network': this.networkLabel(),
+      },
+      () =>
+        this.resolveDisputeInternal(
+          contractEscrowId,
+          resolution,
+          callerAddress,
+        ),
+    );
+  }
+
+  private async resolveDisputeInternal(
+    contractEscrowId: bigint,
+    resolution: 'RELEASE' | 'REFUND',
+    callerAddress: string,
   ): Promise<string> {
     return this.invokeContract(
       'resolve_dispute',
-      [nativeToScVal(escrowId), nativeToScVal(resolution)],
-      { escrowId, resolution },
+      [
+        new Address(callerAddress).toScVal(),
+        nativeToScVal(contractEscrowId, { type: 'u64' }),
+        toResolutionType(resolution),
+      ],
+      {
+        callerAddress,
+        contractEscrowId: contractEscrowId.toString(),
+        resolution,
+      },
     );
   }
 
@@ -73,7 +167,7 @@ export class ContractService {
    * with the current sequence number — preventing tx_bad_seq retry failures.
    */
   async submitAutoRelease(
-    escrowId: string,
+    contractEscrowId: bigint,
     sourceAddress: string,
     maxRetries = DEFAULT_AUTO_RELEASE_MAX_RETRIES,
   ): Promise<string> {
@@ -84,10 +178,26 @@ export class ContractService {
     let attempt = 0;
     while (attempt <= maxRetries) {
       try {
-        return await this.invokeContract(
-          'auto_release',
-          [nativeToScVal(escrowId)],
-          { sourceAddress, escrowId },
+        // Each attempt gets its own span so a retried sequence error is
+        // visible per try rather than collapsed into one failed span.
+        return await this.traced(
+          'stellar.contract.auto_release.attempt',
+          {
+            'trustlink.stellar.function': 'auto_release',
+            'trustlink.escrow.contract_id': contractEscrowId.toString(),
+            'trustlink.stellar.network': this.networkLabel(),
+            'trustlink.stellar.attempt': attempt + 1,
+            'trustlink.stellar.max_attempts': maxRetries + 1,
+          },
+          () =>
+            this.invokeContract(
+              'auto_release',
+              // `auto_release(env, escrow_id: u64)`. The type must be given
+              // explicitly: nativeToScVal on a bare value guesses, and the
+              // contract rejects anything that is not a u64.
+              [nativeToScVal(contractEscrowId, { type: 'u64' })],
+              { sourceAddress, contractEscrowId: contractEscrowId.toString() },
+            ),
         );
       } catch (error) {
         if (error instanceof ContractCallFailedException) {
@@ -100,7 +210,7 @@ export class ContractService {
         }
 
         if (this.isSequenceError(error)) {
-          throw new Error('Max retries exceeded');
+          throw new ContractCallFailedException('Max retries exceeded');
         }
 
         throw new ContractCallFailedException(
@@ -112,10 +222,34 @@ export class ContractService {
     throw new ContractCallFailedException('Max retries exceeded');
   }
 
-  /** Returns the current on-chain state of an escrow. */
+  /**
+   * Reads the current on-chain state of an escrow by its `u64` contract id.
+   *
+   * Read-only — no transaction, no signature. Returns
+   * `{ state: 'UNKNOWN', exists: false }` (rather than throwing) whenever the
+   * RPC server is not configured or the escrow cannot be read, so a caller
+   * must check `exists` before trusting `state`. `state` is the raw
+   * contract-side string, which is not guaranteed to match the backend's own
+   * escrow-state enum.
+   */
   async getEscrowState(
-    escrowId: string,
+    contractEscrowId: bigint,
   ): Promise<{ state: string; exists: boolean }> {
+    return this.traced(
+      'stellar.contract.get_escrow_state',
+      {
+        'trustlink.stellar.function': 'get_escrow',
+        'trustlink.escrow.contract_id': contractEscrowId.toString(),
+        'trustlink.stellar.network': this.networkLabel(),
+      },
+      () => this.getEscrowStateInternal(contractEscrowId),
+    );
+  }
+
+  private async getEscrowStateInternal(
+    contractEscrowId: bigint,
+  ): Promise<{ state: string; exists: boolean }> {
+    const escrowId = contractEscrowId.toString();
     if (!this.server) {
       return { state: 'UNKNOWN', exists: false };
     }
@@ -142,9 +276,7 @@ export class ContractService {
     }
 
     try {
-      const contractId =
-        this.config?.get('CONTRACT_ID') ||
-        'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4';
+      const contractId = this.getContractId();
       const contract = new Contract(contractId);
       const dummyAccount = new Account(
         'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
@@ -163,7 +295,7 @@ export class ContractService {
         .setTimeout(30)
         .build();
 
-      const simResult = await this.simulateTransaction(tx);
+      const simResult = await this.simulateTransaction(tx, 'get_escrow');
       if (this.isSimulationError(simResult)) {
         return { state: 'UNKNOWN', exists: false };
       }
@@ -173,19 +305,83 @@ export class ContractService {
     }
   }
 
-  /** Submits an on-chain cancellation/refund transaction (`cancel_escrow`) and returns the transaction hash. */
-  async cancelEscrowOnChain(escrowId: string): Promise<string> {
-    return this.invokeContract('cancel_escrow', [nativeToScVal(escrowId)], {
-      escrowId,
-      refund: true,
-    });
+  /**
+   * Submits an on-chain cancellation/refund transaction (`cancel_escrow`) and
+   * returns the transaction hash.
+   *
+   * Contract signature is `cancel_escrow(env, caller: Address,
+   * escrow_id: u64)`, and it calls `caller.require_auth()`.
+   */
+  async cancelEscrowOnChain(
+    contractEscrowId: bigint,
+    callerAddress: string,
+  ): Promise<string> {
+    return this.traced(
+      'stellar.contract.cancel_escrow',
+      {
+        'trustlink.stellar.function': 'cancel_escrow',
+        'trustlink.escrow.contract_id': contractEscrowId.toString(),
+        'trustlink.stellar.network': this.networkLabel(),
+      },
+      () => this.cancelEscrowOnChainInternal(contractEscrowId, callerAddress),
+    );
   }
 
-  /** Records delivery on-chain (`record_delivery`) and returns the submitted transaction hash. */
-  async recordDelivery(escrowId: string): Promise<string> {
-    return this.invokeContract('record_delivery', [nativeToScVal(escrowId)], {
-      escrowId,
-    });
+  private async cancelEscrowOnChainInternal(
+    contractEscrowId: bigint,
+    callerAddress: string,
+  ): Promise<string> {
+    return this.invokeContract(
+      'cancel_escrow',
+      [
+        new Address(callerAddress).toScVal(),
+        nativeToScVal(contractEscrowId, { type: 'u64' }),
+      ],
+      {
+        callerAddress,
+        contractEscrowId: contractEscrowId.toString(),
+        refund: true,
+      },
+    );
+  }
+
+  /**
+   * Records delivery on-chain (`record_delivery`) and returns the submitted
+   * transaction hash.
+   *
+   * The contract signature is `record_delivery(env, caller: Address,
+   * escrow_id: u64)`. It calls `caller.require_auth()` and then rejects the
+   * call outright unless `caller` equals the contract admin, so the address
+   * passed here must be the configured `ADMIN_ADDRESS` and the transaction
+   * must be signed by that key.
+   */
+  async recordDelivery(
+    contractEscrowId: bigint,
+    callerAddress: string,
+  ): Promise<string> {
+    return this.traced(
+      'stellar.contract.record_delivery',
+      {
+        'trustlink.stellar.function': 'record_delivery',
+        'trustlink.escrow.contract_id': contractEscrowId.toString(),
+        'trustlink.stellar.network': this.networkLabel(),
+      },
+      () => this.recordDeliveryInternal(contractEscrowId, callerAddress),
+    );
+  }
+
+  private async recordDeliveryInternal(
+    contractEscrowId: bigint,
+    callerAddress: string,
+  ): Promise<string> {
+    return this.invokeContract(
+      'record_delivery',
+      [
+        new Address(callerAddress).toScVal(),
+        nativeToScVal(contractEscrowId, { type: 'u64' }),
+      ],
+      { callerAddress, contractEscrowId: contractEscrowId.toString() },
+    );
   }
 
   /**
@@ -193,6 +389,29 @@ export class ContractService {
    * fetch account -> build -> simulate -> prepare -> sign -> submit -> poll.
    */
   private async invokeContract(
+    functionName: string,
+    args: xdr.ScVal[],
+    legacyParams: Record<string, unknown>,
+  ): Promise<string> {
+    return this.traced(
+      'stellar.contract.invoke',
+      {
+        'trustlink.stellar.function': functionName,
+        'trustlink.stellar.network': this.networkLabel(),
+        ...(typeof legacyParams.contractEscrowId === 'string' ||
+        typeof legacyParams.contractEscrowId === 'number' ||
+        typeof legacyParams.contractEscrowId === 'bigint'
+          ? {
+              'trustlink.escrow.contract_id':
+                legacyParams.contractEscrowId.toString(),
+            }
+          : {}),
+      },
+      () => this.invokeContractInternal(functionName, args, legacyParams),
+    );
+  }
+
+  private async invokeContractInternal(
     functionName: string,
     args: xdr.ScVal[],
     legacyParams: Record<string, unknown>,
@@ -238,27 +457,33 @@ export class ContractService {
       return result.hash;
     }
 
+    const contractId = this.getContractId();
+
     const secret = this.config?.get<string>('SYSTEM_SIGNER_SECRET');
     let signerKeypair: Keypair | null = null;
     if (secret) {
       try {
         signerKeypair = Keypair.fromSecret(secret);
       } catch {
-        // Ignore keypair parsing errors if invalid test secret
+        this.logger.warn(
+          'SYSTEM_SIGNER_SECRET is present but cannot be parsed as a Stellar secret key — check the value',
+        );
       }
     }
 
     const sourcePublic =
       (legacyParams.sourceAddress as string | undefined) ||
-      signerKeypair?.publicKey() ||
-      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
+      signerKeypair?.publicKey();
+
+    if (!sourcePublic) {
+      throw new ContractCallFailedException(
+        'No source address available: SYSTEM_SIGNER_SECRET is missing or invalid and no sourceAddress was provided',
+      );
+    }
 
     // Step 1: Fetch source account
     const account = await this.fetchAccount(sourcePublic);
 
-    const contractId =
-      this.config?.get('CONTRACT_ID') ||
-      'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4';
     let contract: Contract;
     try {
       contract = new Contract(contractId);
@@ -281,7 +506,7 @@ export class ContractService {
       .build();
 
     // Step 3: Simulate transaction
-    const simResult = await this.simulateTransaction(tx);
+    const simResult = await this.simulateTransaction(tx, functionName);
     if (this.isSimulationError(simResult)) {
       const errorMsg = this.decodeSimulationError(simResult);
       throw new ContractCallFailedException(`Simulation failed: ${errorMsg}`);
@@ -306,7 +531,7 @@ export class ContractService {
     }
 
     // Step 6: Submit transaction
-    const sendResult = await this.submitTransaction(preparedTx);
+    const sendResult = await this.submitTransaction(preparedTx, functionName);
     if (sendResult.status === 'ERROR') {
       // The SDK types the error payload loosely and the field name has moved
       // between versions, so read both defensively rather than casting to any.
@@ -333,7 +558,7 @@ export class ContractService {
     }
 
     // Step 7: Poll until final status
-    const finalTx = await this.pollTransactionStatus(txHash);
+    const finalTx = await this.pollTransactionStatus(txHash, functionName);
     // Compared as a string: pollTransactionStatus can return a test double
     // whose status is a plain string rather than the SDK's enum member.
     if (String(finalTx.status) === 'FAILED') {
@@ -376,12 +601,22 @@ export class ContractService {
 
   private async simulateTransaction(
     tx: Transaction,
+    functionName: string,
   ): Promise<rpc.Api.SimulateTransactionResponse> {
-    if (typeof this.server?.simulateTransaction === 'function') {
-      return this.server.simulateTransaction(tx);
-    }
-    throw new ContractCallFailedException(
-      'simulateTransaction is not supported',
+    return this.traced(
+      'stellar.contract.simulate',
+      {
+        'trustlink.stellar.function': functionName,
+        'trustlink.stellar.network': this.networkLabel(),
+      },
+      async () => {
+        if (typeof this.server?.simulateTransaction === 'function') {
+          return this.server.simulateTransaction(tx);
+        }
+        throw new ContractCallFailedException(
+          'simulateTransaction is not supported',
+        );
+      },
     );
   }
 
@@ -413,28 +648,89 @@ export class ContractService {
 
   private async submitTransaction(
     tx: Transaction,
+    functionName: string,
   ): Promise<rpc.Api.SendTransactionResponse> {
-    if (typeof this.server?.sendTransaction === 'function') {
-      return this.server.sendTransaction(tx);
-    }
-    throw new ContractCallFailedException('sendTransaction is not supported');
+    return this.traced(
+      'stellar.contract.submit',
+      {
+        'trustlink.stellar.function': functionName,
+        'trustlink.stellar.network': this.networkLabel(),
+      },
+      async () => {
+        if (typeof this.server?.sendTransaction === 'function') {
+          return this.server.sendTransaction(tx);
+        }
+        throw new ContractCallFailedException(
+          'sendTransaction is not supported',
+        );
+      },
+    );
   }
 
   private async pollTransactionStatus(
     hash: string,
+    functionName: string,
   ): Promise<rpc.Api.GetTransactionResponse> {
-    if (typeof this.server?.pollTransaction === 'function') {
-      return this.server.pollTransaction(hash);
-    }
-    if (typeof this.server?.getTransaction === 'function') {
-      const res = await this.server.getTransaction(hash);
-      const statusStr = String(res.status);
-      if (statusStr === 'NOT_FOUND' || statusStr === 'PENDING') {
-        return res;
+    return this.traced(
+      'stellar.contract.confirm',
+      {
+        'trustlink.stellar.function': functionName,
+        'trustlink.stellar.tx_hash': hash,
+        'trustlink.stellar.network': this.networkLabel(),
+      },
+      async () => {
+        if (typeof this.server?.pollTransaction === 'function') {
+          return this.server.pollTransaction(hash);
+        }
+        if (typeof this.server?.getTransaction === 'function') {
+          // Issue #921 — the RPC `getTransaction` only reports a point-in-time
+          // status, so poll it until the transaction reaches a final status or
+          // the bounded timeout elapses rather than returning PENDING/NOT_FOUND
+          // immediately (which the caller would treat as success).
+          const getTransaction = this.server.getTransaction.bind(this.server);
+          return this.pollWithGetTransaction(hash, getTransaction);
+        }
+        // Issue #921 — no way to confirm means no success can be reported. The
+        // previous fallback returned a fabricated `{ status: 'SUCCESS' }`,
+        // silently marking an unconfirmed transaction as released.
+        throw new ContractCallFailedException(
+          'Unable to confirm transaction: the Stellar server exposes neither pollTransaction nor getTransaction',
+        );
+      },
+    );
+  }
+
+  /**
+   * Polls `getTransaction` until the status is final (anything other than
+   * NOT_FOUND/PENDING) or the bounded timeout is reached. On timeout it
+   * throws rather than reporting an unconfirmed transaction as successful.
+   */
+  private async pollWithGetTransaction(
+    hash: string,
+    getTransaction: (hash: string) => Promise<rpc.Api.GetTransactionResponse>,
+  ): Promise<rpc.Api.GetTransactionResponse> {
+    const deadline = Date.now() + TX_CONFIRM_TIMEOUT_MS;
+    let response = await getTransaction(hash);
+
+    while (this.isPendingStatus(response.status)) {
+      if (Date.now() >= deadline) {
+        throw new ContractCallFailedException(
+          `Transaction ${hash} was not confirmed within ${TX_CONFIRM_TIMEOUT_MS}ms`,
+        );
       }
-      return res;
+      await new Promise((resolve) =>
+        setTimeout(resolve, TX_CONFIRM_POLL_INTERVAL_MS),
+      );
+      response = await getTransaction(hash);
     }
-    return { status: 'SUCCESS' } as rpc.Api.GetTransactionResponse;
+
+    return response;
+  }
+
+  /** True while a `getTransaction` status is non-final (still in flight). */
+  private isPendingStatus(status: unknown): boolean {
+    const value = String(status);
+    return value === 'NOT_FOUND' || value === 'PENDING';
   }
 
   private isSimulationError(
@@ -467,6 +763,16 @@ export class ContractService {
         : JSON.stringify(resultXdr);
     }
     return 'Transaction failed on chain';
+  }
+
+  private getContractId(): string {
+    const contractId = this.config?.get<string>('CONTRACT_ID');
+    if (!contractId) {
+      throw new ContractCallFailedException(
+        'CONTRACT_ID is not configured; cannot invoke contract.',
+      );
+    }
+    return contractId;
   }
 
   private isSequenceError(error: unknown): boolean {

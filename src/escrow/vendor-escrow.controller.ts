@@ -6,11 +6,13 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
+import { THROTTLE_WINDOW_MS } from '../common/security/throttle.config';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import type { AuthUser } from '../auth/auth-user';
 import { JwtGuard } from '../auth/guards/jwt.guard';
 import { EscrowService } from './escrow.service';
 import { VendorEscrowsQueryDto } from './dto/vendor-escrows-query.dto';
+import { VendorEscrowsPaginatedResponseDto } from './dto/vendor-escrows-paginated-response.dto';
 
 @ApiTags('Vendor')
 @ApiBearerAuth()
@@ -34,12 +36,13 @@ export class VendorEscrowController {
   @ApiResponse({
     status: 200,
     description: 'Paginated list of vendor escrows returned.',
+    type: VendorEscrowsPaginatedResponseDto,
   })
   @ApiResponse({ status: 401, description: 'Unauthorized.' })
   @ApiResponse({ status: 403, description: 'Forbidden.' })
   @ApiResponse({ status: 429, description: 'Too many requests.' })
   @ApiResponse({ status: 500, description: 'Internal server error.' })
-  @Throttle({ auth: { limit: 20, ttl: 60000 } })
+  @Throttle({ default: { limit: 20, ttl: THROTTLE_WINDOW_MS } })
   @Get('escrows')
   async getEscrows(
     @Query() query: VendorEscrowsQueryDto,

@@ -66,6 +66,12 @@ describe('CacheService (issue #285) — Redis mode', () => {
       const result = await service.get('missing-key');
       expect(result).toBeNull();
     });
+
+    it('returns null when Redis cannot read the key', async () => {
+      redisMock.get.mockRejectedValue(new Error('connection lost'));
+
+      await expect(service.get('unavailable-key')).resolves.toBeNull();
+    });
   });
 
   describe('set()', () => {
@@ -90,6 +96,37 @@ describe('CacheService (issue #285) — Redis mode', () => {
         120,
       );
     });
+
+    it('handles a Redis write failure without claiming the value was cached', async () => {
+      redisMock.set.mockRejectedValue(new Error('write failed'));
+
+      await expect(
+        service.set('unavailable-key', 'value'),
+      ).resolves.toBeUndefined();
+      expect(redisMock.set).toHaveBeenCalledWith(
+        'unavailable-key',
+        JSON.stringify('value'),
+        'EX',
+        60,
+      );
+    });
+  });
+
+  describe('ping()', () => {
+    it.each([
+      ['PONG', 'ok'],
+      ['unexpected reply', 'down'],
+    ])('returns %s state for a Redis reply of %s', async (reply, expected) => {
+      redisMock.ping.mockResolvedValue(reply);
+
+      await expect(service.ping()).resolves.toBe(expected);
+    });
+
+    it('returns down when Redis ping fails', async () => {
+      redisMock.ping.mockRejectedValue(new Error('unreachable'));
+
+      await expect(service.ping()).resolves.toBe('down');
+    });
   });
 
   describe('del()', () => {
@@ -103,6 +140,12 @@ describe('CacheService (issue #285) — Redis mode', () => {
       redisMock.del.mockResolvedValue(0);
       await service.del('another-key');
       expect(redisMock.del).toHaveBeenCalledWith('another-key');
+    });
+
+    it('handles a Redis delete failure', async () => {
+      redisMock.del.mockRejectedValue(new Error('delete failed'));
+
+      await expect(service.del('unavailable-key')).resolves.toBeUndefined();
     });
   });
 
@@ -128,6 +171,12 @@ describe('CacheService (issue #285) — in-memory fallback mode', () => {
           >
         ).size
       : -1;
+  }
+
+  function hasMemoryEntry(key: string): boolean {
+    const memory = (service as unknown as { memory: Map<string, unknown> })
+      .memory;
+    return memory.has(key);
   }
 
   beforeEach(() => {
@@ -204,6 +253,12 @@ describe('CacheService (issue #285) — in-memory fallback mode', () => {
     });
   });
 
+  describe('ping()', () => {
+    it('returns "disabled" when no Redis client is configured', async () => {
+      await expect(service.ping()).resolves.toBe('disabled');
+    });
+  });
+
   describe('onModuleDestroy()', () => {
     it('resolves without error when there is no Redis client', async () => {
       await expect(service.onModuleDestroy()).resolves.toBeUndefined();
@@ -222,34 +277,41 @@ describe('CacheService (issue #285) — in-memory fallback mode', () => {
 
   describe('sweep (issue #506)', () => {
     it('removes expired entries via periodic sweep without a get() for that key', async () => {
+      service['stopSweeper']();
       jest.useFakeTimers();
-      await service.set('expires-fast', 'gone', 1);
-      await service.set('stays', 'here', 3600);
+      service['startSweeper']();
+      try {
+        await service.set('expires-fast', 'gone', 1);
+        await service.set('stays', 'here', 3600);
 
-      // Advance past TTL of first entry but within sweep interval
-      jest.advanceTimersByTime(1500);
-      // After TTL but before sweep, a get() would lazily delete it
-      // Now advance past the sweep interval so the timer fires
-      jest.advanceTimersByTime(61_000);
+        await jest.advanceTimersByTimeAsync(61_000);
 
-      // The expired entry should have been swept — verify it's gone
-      expect(await service.get('expires-fast')).toBeNull();
-      // The valid entry is unaffected
-      expect(await service.get('stays')).toBe('here');
-
-      jest.useRealTimers();
+        // Inspect the map directly so get() cannot lazily remove the expired
+        // entry and mask a broken sweep implementation.
+        expect(hasMemoryEntry('expires-fast')).toBe(false);
+        expect(hasMemoryEntry('stays')).toBe(true);
+      } finally {
+        service['stopSweeper']();
+        jest.useRealTimers();
+      }
     });
 
     it('does not remove entries that are still within their TTL window', async () => {
+      service['stopSweeper']();
       jest.useFakeTimers();
-      await service.set('valid-1', 'a', 3600);
-      await service.set('valid-2', 'b', 3600);
+      service['startSweeper']();
+      try {
+        await service.set('valid-1', 'a', 3600);
+        await service.set('valid-2', 'b', 3600);
 
-      jest.advanceTimersByTime(61_000);
+        await jest.advanceTimersByTimeAsync(61_000);
 
-      expect(await service.get('valid-1')).toBe('a');
-      expect(await service.get('valid-2')).toBe('b');
-      jest.useRealTimers();
+        expect(hasMemoryEntry('valid-1')).toBe(true);
+        expect(hasMemoryEntry('valid-2')).toBe(true);
+      } finally {
+        service['stopSweeper']();
+        jest.useRealTimers();
+      }
     });
   });
 

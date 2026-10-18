@@ -7,6 +7,7 @@ import {
   PrismaService,
   toEscrowRecord,
 } from '../prisma/prisma.service';
+import { MILLISECONDS_PER_HOUR } from '../common/constants/time.constants';
 import { CreateEscrowDto } from './dto/create-escrow.dto';
 import {
   AUTO_RELEASE_WINDOW_HOURS,
@@ -194,6 +195,41 @@ export class EscrowRepository {
     return toEscrowRecord(result);
   }
 
+  /**
+   * Resolves a Soroban contract escrow id (`u64`) to the backend escrow's UUID.
+   *
+   * The contract mints its own identifier from an on-chain counter and the
+   * backend mints a UUID, so inbound chain events carry an id this side cannot
+   * use directly. `contractEscrowId` is the only join between them, and it is
+   * unique, so at most one row can match. Returns null when the on-chain escrow
+   * has not been mapped to a backend row yet.
+   */
+  /**
+   * Returns the on-chain `contractEscrowId` for a backend escrow, or null
+   * when the row does not exist or was never submitted on-chain.
+   *
+   * Callers that need to invoke the contract (e.g. the DLQ replay path,
+   * issue #844) only ever want the u64 the contract minted — not the whole
+   * row — so the lookup selects just that column.
+   */
+  async findContractEscrowId(id: string): Promise<bigint | null> {
+    const row = await this.prisma.escrow.findUnique({
+      where: { id },
+      select: { contractEscrowId: true },
+    });
+    return row?.contractEscrowId ?? null;
+  }
+
+  async findIdByContractEscrowId(
+    contractEscrowId: bigint,
+  ): Promise<string | null> {
+    const row = await this.prisma.escrow.findUnique({
+      where: { contractEscrowId },
+      select: { id: true },
+    });
+    return row?.id ?? null;
+  }
+
   /** Transitions the escrow to COMPLETED and invalidates the cache. */
   async markCompleted(id: string): Promise<EscrowRecord> {
     const result = await this.prisma.escrow.update({
@@ -284,13 +320,14 @@ export class EscrowRepository {
    * used by the tracking poll worker to check for delivery updates.
    */
   findShippedWithTracking(): Promise<EscrowRecord[]> {
+    // Both predicates are in the `where` so Postgres can use the whole
+    // `@@index([state, trackingId])` — previously the `trackingId` half ran
+    // as a JS `.filter` after every SHIPPED row had already been loaded and
+    // transferred (#669). `not: null` (never `not: undefined`) is what emits
+    // `IS NOT NULL`.
     return this.prisma.escrow
-      .findMany({ where: { state: 'SHIPPED' } })
-      .then((escrows) =>
-        escrows
-          .filter((escrow) => Boolean(escrow.trackingId))
-          .map(toEscrowRecord),
-      );
+      .findMany({ where: { state: 'SHIPPED', trackingId: { not: null } } })
+      .then((escrows) => escrows.map(toEscrowRecord));
   }
 
   /**
@@ -311,7 +348,8 @@ export class EscrowRepository {
     referenceTime = new Date(),
   ): Promise<AutoReleaseEligibleResult> {
     const cutoff = new Date(
-      referenceTime.getTime() - AUTO_RELEASE_WINDOW_HOURS * 60 * 60 * 1000,
+      referenceTime.getTime() -
+        AUTO_RELEASE_WINDOW_HOURS * MILLISECONDS_PER_HOUR,
     );
     return this.prisma.escrow
       .findMany({

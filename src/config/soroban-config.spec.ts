@@ -1,3 +1,4 @@
+import * as Joi from 'joi';
 import { configValidationSchema } from './config.schema';
 
 /**
@@ -16,6 +17,7 @@ import { configValidationSchema } from './config.schema';
 const BASE_ENV: Record<string, string> = {
   DATABASE_URL: 'postgresql://test:test@localhost:5432/test',
   SEP10_JWT_SECRET: 'test-jwt-secret-32-characters-long!!',
+  PRESIGN_SECRET: 'test-presign-secret-64hexcharacters-for-hmac',
   SYSTEM_SIGNER_SECRET:
     'SAIJDXETR5B7YFPH7SUOISWVBHHSI46JLYFDCWDMEV2L46XAHASPP35C',
   ADMIN_ADDRESS: 'GBEFNNUJ3IRKU2JEAMWBA7YI52HF2GYPHMDXF37T75GHK5KU2Y2QSUAJ',
@@ -31,6 +33,8 @@ const PRODUCTION_ENV: Record<string, string> = {
   SENTRY_DSN: 'https://key@org.ingest.sentry.io/123',
   CONTACT_ENCRYPTION_KEY: 'a'.repeat(64),
   CREDENTIAL_ENCRYPTION_KEY: 'a'.repeat(64),
+  FRONTEND_URL: 'https://app.trustlink.example.com',
+  EVIDENCE_STORAGE_BASE_URL: 'https://storage.trustlink.example.com',
 };
 
 function validate(env: Record<string, string>) {
@@ -42,6 +46,32 @@ function validate(env: Record<string, string>) {
 
 describe('Soroban configuration validation', () => {
   describe('SOROBAN_RPC_URL', () => {
+    it('assumes TESTNET when the URL is validated in a context without STELLAR_NETWORK', () => {
+      // In the full schema STELLAR_NETWORK is defaulted before the URL rule
+      // runs, so the validator always sees a network. Host the extracted rule
+      // in an object that supplies NODE_ENV (which the rule references) but
+      // no STELLAR_NETWORK: the fallback is TESTNET, so a mainnet URL is
+      // rejected and a testnet URL is accepted.
+      const hosted = Joi.object({
+        NODE_ENV: Joi.string(),
+        SOROBAN_RPC_URL: configValidationSchema.extract('SOROBAN_RPC_URL'),
+      });
+
+      const mainnet = hosted.validate({
+        NODE_ENV: 'development',
+        SOROBAN_RPC_URL: 'https://soroban-mainnet.example.com',
+      });
+      expect(mainnet.error?.message).toContain(
+        'points at a mainnet endpoint while STELLAR_NETWORK is TESTNET',
+      );
+
+      const testnet = hosted.validate({
+        NODE_ENV: 'development',
+        SOROBAN_RPC_URL: 'https://soroban-testnet.example.com',
+      });
+      expect(testnet.error).toBeUndefined();
+    });
+
     it('fails in production when SOROBAN_RPC_URL is missing', () => {
       const { error } = validate(PRODUCTION_ENV);
       expect(error).toBeDefined();

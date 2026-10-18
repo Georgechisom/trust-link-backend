@@ -1,10 +1,19 @@
-import { ServiceUnavailableException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import type { TestingModule } from '@nestjs/testing';
 import { DlqController } from './dlq.controller';
+import { ListFailedTransactionsQueryDto } from './dto/list-failed-transactions-query.dto';
 import { DlqService } from './dlq.service';
 import { ContractService } from '../stellar/contract.service';
-import { ConfigService } from '../config/config.service';
+import { EscrowRepository } from '../escrow/escrow.repository';
+import {
+  AutoReleaseSourceNotConfiguredError,
+  ConfigService,
+} from '../config/config.service';
 import { FailedTransactionRecord } from './dlq.types';
 
 describe('DlqController', () => {
@@ -25,6 +34,10 @@ describe('DlqController', () => {
 
   const buildController = async (
     autoReleaseSourceAddress: string | undefined,
+    // Issue #844: EscrowRepository.findContractEscrowId returns the contract's
+    // own u64 (or null), where the controller previously read it off a Prisma
+    // row itself.
+    contractEscrowId: bigint | null = 42n,
   ) => {
     const dlq = {
       list: jest.fn(),
@@ -39,6 +52,12 @@ describe('DlqController', () => {
 
     const config = {
       get: jest.fn().mockReturnValue(autoReleaseSourceAddress),
+      requireAutoReleaseSourceAddress: jest.fn((): string => {
+        if (!autoReleaseSourceAddress) {
+          throw new AutoReleaseSourceNotConfiguredError();
+        }
+        return autoReleaseSourceAddress;
+      }),
     } as unknown as jest.Mocked<ConfigService>;
 
     const moduleRef: TestingModule = await Test.createTestingModule({
@@ -47,6 +66,14 @@ describe('DlqController', () => {
         { provide: DlqService, useValue: dlq },
         { provide: ContractService, useValue: contract },
         { provide: ConfigService, useValue: config },
+        {
+          // Replay translates the DLQ record's backend UUID to the contract's
+          // own u64 before calling auto_release.
+          provide: EscrowRepository,
+          useValue: {
+            findContractEscrowId: jest.fn().mockResolvedValue(contractEscrowId),
+          },
+        },
       ],
     }).compile();
 
@@ -54,6 +81,7 @@ describe('DlqController', () => {
       controller: moduleRef.get(DlqController),
       dlq,
       contract,
+      config,
     };
   };
 
@@ -86,6 +114,63 @@ describe('DlqController', () => {
       );
       expect(contract.submitAutoRelease).not.toHaveBeenCalled();
     });
+
+    it('responds with HTTP 503 and an error body when AUTO_RELEASE_SOURCE_ADDRESS is not configured', async () => {
+      const { controller, dlq } = await buildController(undefined);
+      dlq.get.mockResolvedValue(autoReleaseRecord);
+      dlq.replay.mockImplementation(async (_id, replay) => {
+        await replay(autoReleaseRecord);
+        return autoReleaseRecord;
+      });
+
+      const err = await controller.replay(autoReleaseRecord.id).catch((e) => e);
+      expect(err).toBeInstanceOf(ServiceUnavailableException);
+      expect(err.getStatus()).toBe(503);
+      expect(err.getResponse()).toMatchObject({ message: expect.any(String) });
+    });
+
+    it('rethrows unrelated errors from the source-address configuration check', async () => {
+      const { controller, dlq, config } = await buildController(
+        'GAUTORELEASESOURCEADDRESS0000000000000000000000000000',
+      );
+      const originalError = new Error('configuration lookup failed');
+      config.requireAutoReleaseSourceAddress.mockImplementation(() => {
+        throw originalError;
+      });
+      dlq.get.mockResolvedValue(autoReleaseRecord);
+      dlq.replay.mockImplementation(async (_id, replay) => {
+        await replay(autoReleaseRecord);
+        return autoReleaseRecord;
+      });
+
+      await expect(controller.replay(autoReleaseRecord.id)).rejects.toBe(
+        originalError,
+      );
+    });
+  });
+
+  describe('POST /admin/dlq/:id/replay — no on-chain escrow id', () => {
+    // Issue #844: the escrow lookup now goes through
+    // EscrowRepository.findContractEscrowId, which returns the contract's u64
+    // or null — "no such escrow" and "escrow not yet submitted on-chain" are
+    // the same answer to the controller, so they are one case here.
+    it('rejects replay with 409 when there is no contractEscrowId', async () => {
+      const { controller, dlq } = await buildController(
+        'GAUTORELEASESOURCEADDRESS0000000000000000000000000000',
+        null,
+      );
+      dlq.get.mockResolvedValue(autoReleaseRecord);
+      dlq.replay.mockImplementation(async (_id, replay) => {
+        await replay(autoReleaseRecord);
+        return autoReleaseRecord;
+      });
+
+      const err = await controller.replay('failed-tx-1').catch((e) => e);
+      expect(err).toBeInstanceOf(ConflictException);
+      expect(err.getStatus()).toBe(409);
+      expect(err.message).toContain('has no contractEscrowId');
+      expect(err.message).toContain('escrow-123');
+    });
   });
 
   describe('POST /admin/dlq/:id/replay', () => {
@@ -107,15 +192,17 @@ describe('DlqController', () => {
 
       const result = await controller.replay('failed-tx-1');
 
+      // Replay translates the record's backend UUID to the contract's u64
+      // before calling auto_release; the mocked lookup returns 42n.
       expect(contract.submitAutoRelease).toHaveBeenCalledWith(
-        'escrow-123',
+        42n,
         'GAUTORELEASESOURCEADDRESS0000000000000000000000000000',
       );
       expect(result.status).toBe('REPLAYED');
       expect(result.lastReplayTxHash).toBe('tx-hash-abc');
     });
 
-    it('rejects operations other than submitAutoRelease', async () => {
+    it('rejects operations other than submitAutoRelease with 400', async () => {
       const { controller, dlq, contract } = await buildController(
         'GAUTORELEASESOURCEADDRESS0000000000000000000000000000',
       );
@@ -129,9 +216,11 @@ describe('DlqController', () => {
         throw new Error('unreachable');
       });
 
-      await expect(controller.replay('failed-tx-1')).rejects.toThrow(
-        'cannot be replayed automatically',
-      );
+      const err = await controller.replay('failed-tx-1').catch((e) => e);
+      expect(err).toBeInstanceOf(BadRequestException);
+      expect(err.getStatus()).toBe(400);
+      expect(err.message).toContain('cannot be replayed automatically');
+      expect(err.message).toContain('resolveDispute');
       expect(contract.submitAutoRelease).not.toHaveBeenCalled();
     });
 
@@ -166,21 +255,16 @@ describe('DlqController', () => {
       };
       dlq.list.mockResolvedValue(paginated);
 
-      const result = await controller.list(
-        'PENDING_REVIEW',
-        'submitAutoRelease',
-        'escrow-123',
-        '2',
-        '10',
-      );
-
-      expect(dlq.list).toHaveBeenCalledWith({
+      const query = Object.assign(new ListFailedTransactionsQueryDto(), {
         status: 'PENDING_REVIEW',
         operation: 'submitAutoRelease',
         escrowId: 'escrow-123',
         page: 2,
         limit: 10,
       });
+      const result = await controller.list(query);
+
+      expect(dlq.list).toHaveBeenCalledWith(query);
       expect(result).toEqual(paginated);
     });
 
@@ -191,9 +275,10 @@ describe('DlqController', () => {
       const emptyPaginated = { data: [], total: 0, page: 1, limit: 20 };
       dlq.list.mockResolvedValue(emptyPaginated);
 
-      const result = await controller.list();
+      const query = new ListFailedTransactionsQueryDto();
+      const result = await controller.list(query);
 
-      expect(dlq.list).toHaveBeenCalledWith({});
+      expect(dlq.list).toHaveBeenCalledWith(query);
       expect(result).toEqual(emptyPaginated);
     });
   });

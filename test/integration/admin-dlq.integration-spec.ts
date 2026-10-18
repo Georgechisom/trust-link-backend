@@ -1,5 +1,6 @@
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
+import { ensureVendors } from '../prisma-helpers';
 import { Prisma } from '@prisma/client';
 import { createHmac } from 'crypto';
 import request from 'supertest';
@@ -55,7 +56,9 @@ describe('Admin DLQ Operations (issue #297)', () => {
     const header = Buffer.from(
       JSON.stringify({ alg: 'HS256', typ: 'JWT' }),
     ).toString('base64url');
-    const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const body = Buffer.from(
+      JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600, ...payload }),
+    ).toString('base64url');
     const signature = createHmac('sha256', jwtSecret)
       .update(`${header}.${body}`)
       .digest('base64url');
@@ -148,6 +151,17 @@ describe('Admin DLQ Operations (issue #297)', () => {
       expect(res.body.data).toHaveLength(1);
       expect(res.body.data[0].operation).toBe('submitAutoRelease');
     });
+
+    it.each([
+      ['/admin/dlq?page=abc', 'non-numeric page'],
+      ['/admin/dlq?limit=101', 'out-of-range limit'],
+      ['/admin/dlq?status=BOGUS', 'unknown status'],
+    ])('rejects %s with 400 (%s)', async (path) => {
+      await request(httpServer())
+        .get(path)
+        .set('Authorization', `Bearer ${adminJwt()}`)
+        .expect(400);
+    });
   });
 
   describe('GET /admin/dlq/:id', () => {
@@ -174,6 +188,24 @@ describe('Admin DLQ Operations (issue #297)', () => {
 
   describe('POST /admin/dlq/:id/replay', () => {
     it('replays a submitAutoRelease operation', async () => {
+      // Replay translates the DLQ record's backend UUID to the contract's own
+      // u64 before calling auto_release, so the escrow row has to exist and
+      // carry the mapping.
+      await ensureVendors(prisma, 'vendor-replay');
+      await prisma.escrow.create({
+        data: {
+          id: 'escrow-replay-001',
+          contractEscrowId: 501n,
+          itemName: 'Replay Widget',
+          itemRef: 'replay-001',
+          amount: 100,
+          currency: 'USDC',
+          buyerAddress: 'buyer-replay',
+          vendorAddress: 'vendor-replay',
+          state: 'DELIVERED',
+        },
+      });
+
       const entry = await seedDlqEntry({
         operation: 'submitAutoRelease',
         escrowId: 'escrow-replay-001',
@@ -187,7 +219,7 @@ describe('Admin DLQ Operations (issue #297)', () => {
       expect(res.body.status).toBe('REPLAYED');
       expect(res.body.lastReplayTxHash).toBe('tx-hash-replayed-001');
       expect(contractService.submitAutoRelease).toHaveBeenCalledWith(
-        'escrow-replay-001',
+        501n,
         configService.get('AUTO_RELEASE_SOURCE_ADDRESS'),
       );
     });
